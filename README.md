@@ -86,7 +86,10 @@ Email OTP login with constant-time hash verification, role-based access checked 
 
 ### 🌍 Self-Hosted
 
-Single Go binary + PostgreSQL + (optional) S3-compatible storage for release artifacts. No Redis, no microservices. Auto-migration on startup. Setup wizard for first run. Custom branding, email templates, and i18n (English/Chinese built-in).
+Single Go binary + PostgreSQL, Redis-backed distributed abuse limits, and
+optional S3-compatible storage for release artifacts. Auto-migration on
+startup. Protected first-run setup, custom branding, email templates, and i18n
+(English/Chinese built-in).
 
 <br />
 
@@ -101,7 +104,9 @@ curl -O https://raw.githubusercontent.com/tabloy/keygate/main/.env.example
 cp .env.example .env
 
 # 2. Set your secrets
-# Edit .env: set JWT_SECRET and LICENSE_SIGNING_KEY (openssl rand -hex 32)
+# Edit .env: set all required secrets, including JWT_SECRET,
+# LICENSE_SIGNING_KEY, RELEASE_KEY_ENCRYPTION_KEY, OTP_PEPPER,
+# METRICS_TOKEN, and the database password.
 
 # 3. Run
 docker compose up -d
@@ -115,7 +120,10 @@ cd keygate && cp .env.example .env
 make build && ./bin/keygate
 ```
 
-Open **http://localhost:9000** — the setup wizard guides you from there.
+For a fresh private deployment, temporarily enable the setup endpoint with a
+high-entropy `BOOTSTRAP_SECRET`; complete setup through the private listener,
+then set `SETUP_ENABLED=false`. See
+[the production baseline](docs/production-deployment.md).
 
 > 📖 Full docs, deployment guides, and SDK examples at **[keygate.app/docs](https://keygate.app/docs)**
 
