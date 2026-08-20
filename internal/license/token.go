@@ -26,17 +26,30 @@ import (
 // arbitrary license tokens. Ed25519 puts the signing capability
 // behind a key that never leaves the server.
 type VerifyToken struct {
-	LicenseID   string         `json:"lid"`
-	ProductID   string         `json:"pid"`
-	PlanID      string         `json:"pln"`
-	Status      string         `json:"sts"`
-	Identifier  string         `json:"did"`
-	Features    map[string]any `json:"ftr,omitempty"`
-	IssuedAt    int64          `json:"iat"`
-	ExpiresAt   int64          `json:"exp"`
-	GraceDays   int            `json:"grc"`
-	Nonce       string         `json:"nce"`           // unique per-issuance to prevent replay
-	Fingerprint string         `json:"fpr,omitempty"` // SHA256(identifier+product_id) for binding
+	KeyID         string         `json:"kid"`
+	Issuer        string         `json:"iss"`
+	PolicyVersion int            `json:"ver"`
+	LicenseID     string         `json:"lid"`
+	ProductID     string         `json:"pid"`
+	PlanID        string         `json:"pln"`
+	Status        string         `json:"sts"`
+	Identifier    string         `json:"did"`
+	Features      map[string]any `json:"ftr,omitempty"`
+	IssuedAt      int64          `json:"iat"`
+	ExpiresAt     int64          `json:"exp"`
+	ValidUntil    int64          `json:"vld,omitempty"`
+	GraceDays     int            `json:"grc"`
+	Nonce         string         `json:"nce"`           // unique per-issuance to prevent replay
+	Fingerprint   string         `json:"fpr,omitempty"` // SHA256(identifier+product_id) for binding
+}
+
+type VerifyOptions struct {
+	Now              time.Time
+	ClockSkew        time.Duration
+	Issuer           string
+	ProductID        string
+	Identifier       string
+	MinPolicyVersion int
 }
 
 // PrivateKeyFromHex parses a 32-byte ed25519 seed (64 hex chars) and
@@ -91,6 +104,17 @@ func Sign(t *VerifyToken, priv ed25519.PrivateKey) (string, error) {
 // returns the decoded payload. ExpiresAt is checked here so callers
 // don't accidentally trust stale tokens.
 func Verify(raw string, pub ed25519.PublicKey) (*VerifyToken, error) {
+	t, err := verifySignatureAndDecode(raw, pub)
+	if err != nil {
+		return nil, err
+	}
+	if t.ExpiresAt > 0 && time.Now().Unix() > t.ExpiresAt {
+		return nil, fmt.Errorf("token expired")
+	}
+	return t, nil
+}
+
+func verifySignatureAndDecode(raw string, pub ed25519.PublicKey) (*VerifyToken, error) {
 	if len(pub) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("ed25519 public key not initialised")
 	}
@@ -114,10 +138,85 @@ func Verify(raw string, pub ed25519.PublicKey) (*VerifyToken, error) {
 	if err := json.Unmarshal(payload, &t); err != nil {
 		return nil, fmt.Errorf("payload unmarshal: %w", err)
 	}
-	if t.ExpiresAt > 0 && time.Now().Unix() > t.ExpiresAt {
+	return &t, nil
+}
+
+// VerifyWithKeySet is the fail-closed client verification path used by Summit
+// and other offline clients. The untrusted kid is used only to select a pinned
+// public key; every security-relevant claim is then checked after signature
+// verification.
+func VerifyWithKeySet(raw string, keys map[string]ed25519.PublicKey, opt VerifyOptions) (*VerifyToken, error) {
+	idx := strings.LastIndexByte(raw, '.')
+	if idx <= 0 {
+		return nil, fmt.Errorf("invalid token format")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(raw[:idx])
+	if err != nil {
+		return nil, fmt.Errorf("payload decode: %w", err)
+	}
+	var unsigned VerifyToken
+	if err := json.Unmarshal(payload, &unsigned); err != nil {
+		return nil, fmt.Errorf("payload unmarshal: %w", err)
+	}
+	if unsigned.KeyID == "" {
+		return nil, fmt.Errorf("missing kid")
+	}
+	pub, ok := keys[unsigned.KeyID]
+	if !ok {
+		return nil, fmt.Errorf("unknown kid")
+	}
+	t, err := verifySignatureAndDecode(raw, pub)
+	if err != nil {
+		return nil, err
+	}
+
+	now := opt.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	skew := opt.ClockSkew
+	if skew < 0 {
+		return nil, fmt.Errorf("invalid clock skew")
+	}
+	if t.LicenseID == "" || t.ProductID == "" || t.Identifier == "" || t.Issuer == "" || t.PolicyVersion <= 0 || t.IssuedAt <= 0 || t.ExpiresAt <= 0 {
+		return nil, fmt.Errorf("malformed required claims")
+	}
+	switch t.Status {
+	case "active", "trialing", "past_due", "canceled":
+	default:
+		return nil, fmt.Errorf("inactive license status")
+	}
+	if now.Add(skew).Unix() < t.IssuedAt {
+		return nil, fmt.Errorf("token issued in the future")
+	}
+	if now.Add(-skew).Unix() > t.ExpiresAt {
 		return nil, fmt.Errorf("token expired")
 	}
-	return &t, nil
+	if t.ExpiresAt <= t.IssuedAt {
+		return nil, fmt.Errorf("invalid token lifetime")
+	}
+	if opt.Issuer != "" && t.Issuer != opt.Issuer {
+		return nil, fmt.Errorf("issuer mismatch")
+	}
+	if opt.ProductID != "" && t.ProductID != opt.ProductID {
+		return nil, fmt.Errorf("product mismatch")
+	}
+	if opt.Identifier != "" {
+		if t.Identifier != opt.Identifier || t.Fingerprint != Fingerprint(opt.Identifier, t.ProductID) {
+			return nil, fmt.Errorf("device mismatch")
+		}
+	}
+	if opt.MinPolicyVersion > 0 && t.PolicyVersion < opt.MinPolicyVersion {
+		return nil, fmt.Errorf("unsupported token policy")
+	}
+	return t, nil
+}
+
+// KeyID derives a stable, non-secret identifier from a public key. Operators
+// may override it, but the derived form is safe for zero-config deployments.
+func KeyID(pub ed25519.PublicKey) string {
+	h := sha256.Sum256(pub)
+	return hex.EncodeToString(h[:8])
 }
 
 // Fingerprint binds a token to the (identifier, product_id) pair so

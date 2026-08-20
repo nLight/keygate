@@ -2071,8 +2071,56 @@ func (h *AdminHandler) ExportLicenses(c *gin.Context) {
 		return
 	}
 
-	licenses, err := h.Store.ExportLicenses(c, c.Query("product_id"), c.Query("status"))
+	requestedProductID := c.Query("product_id")
+	scopeProductID := ""
+	var callerAPIKey *model.APIKey
+	if v, ok := c.Get("api_key"); ok {
+		if ak, ok := v.(*model.APIKey); ok && ak != nil {
+			callerAPIKey = ak
+			scopeProductID = ak.ProductID
+		}
+	}
+	if scopeProductID != "" && requestedProductID != "" && requestedProductID != scopeProductID {
+		response.Err(c, http.StatusForbidden, "PRODUCT_SCOPE_MISMATCH", "api_key is bound to a different product")
+		return
+	}
+	effectiveProductID := requestedProductID
+	if scopeProductID != "" {
+		effectiveProductID = scopeProductID
+	}
+	status := c.Query("status")
+	licenses, err := h.Store.ExportLicenses(c, store.LicenseExportFilter{
+		ProductID: requestedProductID, ScopeProductID: scopeProductID, Status: status,
+	})
 	if err != nil {
+		if errors.Is(err, store.ErrProductScopeMismatch) {
+			response.Err(c, http.StatusForbidden, "PRODUCT_SCOPE_MISMATCH", "api_key is bound to a different product")
+			return
+		}
+		response.Internal(c)
+		return
+	}
+	actorType := c.GetString("auth_type")
+	if actorType == "session" {
+		actorType = "admin"
+	}
+	actorID := adminID(c)
+	if callerAPIKey != nil {
+		actorID = callerAPIKey.ID
+	}
+	requestID, _ := c.Get("request_id")
+	if err := h.Store.AuditSync(c, &model.AuditLog{
+		Entity: "license_export", EntityID: effectiveProductID, Action: "exported",
+		ActorType: actorType, ActorID: actorID, IPAddress: c.ClientIP(),
+		Changes: map[string]any{
+			"product_id":   effectiveProductID,
+			"status":       status,
+			"format":       format,
+			"result_count": len(licenses),
+			"request_id":   requestID,
+		},
+	}); err != nil {
+		slog.Error("license export audit write failed", "request_id", requestID, "error", err)
 		response.Internal(c)
 		return
 	}

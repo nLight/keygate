@@ -1,9 +1,12 @@
 package service
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"testing"
 	"time"
 
+	lictoken "github.com/tabloy/keygate/internal/license"
 	"github.com/tabloy/keygate/internal/model"
 )
 
@@ -95,6 +98,59 @@ func TestAssertUsable(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestOfflineTokenLifetimeBoundedByLicense(t *testing.T) {
+	seed := make([]byte, ed25519.SeedSize)
+	if _, err := rand.Read(seed); err != nil {
+		t.Fatal(err)
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	now := time.Unix(2_000_000_000, 0)
+	svc := NewLicenseServiceWithConfig(nil, priv, nil, nil, nil, LicenseTokenConfig{
+		Issuer: "issuer", PolicyVersion: 1, TTL: 7 * 24 * time.Hour,
+		Now: func() time.Time { return now },
+	})
+	validUntil := now.Add(time.Hour)
+	lic := &model.License{
+		ID: "lic", ProductID: "prod", PlanID: "plan", Status: model.StatusActive,
+		ValidUntil: &validUntil, Plan: &model.Plan{GraceDays: 7},
+	}
+	raw, err := svc.signToken(lic, "device")
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	parsed, err := lictoken.Verify(raw, lictoken.PublicKey(priv))
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if parsed.ExpiresAt != validUntil.Unix() {
+		t.Fatalf("exp=%d want %d", parsed.ExpiresAt, validUntil.Unix())
+	}
+	if parsed.ValidUntil != validUntil.Unix() || parsed.ProductID != "prod" || parsed.KeyID == "" || parsed.PolicyVersion != 1 {
+		t.Fatalf("required claims missing: %+v", parsed)
+	}
+}
+
+func TestOfflineTokenRejectsNonPositiveOrInactiveLifetime(t *testing.T) {
+	seed := make([]byte, ed25519.SeedSize)
+	_, _ = rand.Read(seed)
+	priv := ed25519.NewKeyFromSeed(seed)
+	now := time.Unix(2_000_000_000, 0)
+	svc := NewLicenseServiceWithConfig(nil, priv, nil, nil, nil, LicenseTokenConfig{
+		Issuer: "issuer", TTL: time.Hour, Now: func() time.Time { return now },
+	})
+	past := now.Add(-time.Second)
+	for _, lic := range []*model.License{
+		{ID: "expired-by-date", ProductID: "p", Status: model.StatusActive, ValidUntil: &past},
+		{ID: "suspended", ProductID: "p", Status: model.StatusSuspended},
+		{ID: "revoked", ProductID: "p", Status: model.StatusRevoked},
+		{ID: "expired", ProductID: "p", Status: model.StatusExpired},
+	} {
+		if _, err := svc.signToken(lic, "device"); err == nil {
+			t.Fatalf("%s received a token", lic.ID)
+		}
 	}
 }
 

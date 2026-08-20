@@ -3,6 +3,7 @@ package payment
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -38,7 +39,8 @@ type StripeHandler struct {
 	// Every inbound webhook event whose Livemode differs is rejected
 	// with 400 — guards against cross-environment delivery (test
 	// secret leaking + replay into prod, or vice versa).
-	Livemode bool
+	Livemode            bool
+	MaxWebhookBodyBytes int64
 
 	mu            sync.RWMutex
 	webhookSecret string // runtime-updatable, guarded by mu
@@ -190,8 +192,22 @@ func (h *StripeHandler) CheckoutByPlan(c *gin.Context) {
 }
 
 func (h *StripeHandler) Webhook(c *gin.Context) {
+	maxBytes := h.MaxWebhookBodyBytes
+	if maxBytes <= 0 {
+		maxBytes = 256 * 1024
+	}
+	if c.Request.ContentLength > maxBytes {
+		response.Err(c, http.StatusRequestEntityTooLarge, "BODY_TOO_LARGE", "Stripe webhook body exceeds the configured limit")
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			response.Err(c, http.StatusRequestEntityTooLarge, "BODY_TOO_LARGE", "Stripe webhook body exceeds the configured limit")
+			return
+		}
 		response.BadRequest(c, "read failed")
 		return
 	}

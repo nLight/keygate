@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"testing"
+	"time"
 )
 
 func testKey(t *testing.T) ed25519.PrivateKey {
@@ -285,5 +286,105 @@ func TestFingerprint(t *testing.T) {
 
 	if len(fp1) != 16 {
 		t.Errorf("fingerprint should be 16 hex chars (8 bytes), got %d", len(fp1))
+	}
+}
+
+func TestVerifyWithKeySet_FailsClosedOnBindingAndClaims(t *testing.T) {
+	priv := testKey(t)
+	pub := PublicKey(priv)
+	kid := KeyID(pub)
+	now := time.Unix(2_000_000_000, 0)
+	base := VerifyToken{
+		KeyID: kid, Issuer: "https://licenses.example.test", PolicyVersion: 2,
+		LicenseID: "lic", ProductID: "summit", PlanID: "pro", Status: "active",
+		Identifier: "device-a", Fingerprint: Fingerprint("device-a", "summit"),
+		IssuedAt: now.Add(-time.Minute).Unix(), ExpiresAt: now.Add(time.Hour).Unix(),
+	}
+	sign := func(tok VerifyToken) string {
+		t.Helper()
+		raw, err := Sign(&tok, priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	opt := VerifyOptions{
+		Now: now, ClockSkew: 2 * time.Minute,
+		Issuer: "https://licenses.example.test", ProductID: "summit",
+		Identifier: "device-a", MinPolicyVersion: 2,
+	}
+	if _, err := VerifyWithKeySet(sign(base), map[string]ed25519.PublicKey{kid: pub}, opt); err != nil {
+		t.Fatalf("valid token rejected: %v", err)
+	}
+
+	wrongProduct := base
+	wrongProduct.ProductID = "other"
+	if _, err := VerifyWithKeySet(sign(wrongProduct), map[string]ed25519.PublicKey{kid: pub}, opt); err == nil {
+		t.Fatal("wrong product accepted")
+	}
+	wrongDevice := base
+	wrongDevice.Identifier = "device-b"
+	wrongDevice.Fingerprint = Fingerprint("device-b", "summit")
+	if _, err := VerifyWithKeySet(sign(wrongDevice), map[string]ed25519.PublicKey{kid: pub}, opt); err == nil {
+		t.Fatal("wrong device accepted")
+	}
+	unknownKid := base
+	unknownKid.KeyID = "unknown"
+	if _, err := VerifyWithKeySet(sign(unknownKid), map[string]ed25519.PublicKey{kid: pub}, opt); err == nil {
+		t.Fatal("unknown kid accepted")
+	}
+	malformed := base
+	malformed.LicenseID = ""
+	if _, err := VerifyWithKeySet(sign(malformed), map[string]ed25519.PublicKey{kid: pub}, opt); err == nil {
+		t.Fatal("malformed claims accepted")
+	}
+}
+
+func TestVerifyWithKeySet_ClockSkewBoundary(t *testing.T) {
+	priv := testKey(t)
+	pub := PublicKey(priv)
+	kid := KeyID(pub)
+	now := time.Unix(2_000_000_000, 0)
+	tok := &VerifyToken{
+		KeyID: kid, Issuer: "issuer", PolicyVersion: 1,
+		LicenseID: "lic", ProductID: "prod", Identifier: "dev", Status: "active",
+		Fingerprint: Fingerprint("dev", "prod"),
+		IssuedAt:    now.Add(-time.Hour).Unix(), ExpiresAt: now.Add(-30 * time.Second).Unix(),
+	}
+	raw, _ := Sign(tok, priv)
+	keys := map[string]ed25519.PublicKey{kid: pub}
+	if _, err := VerifyWithKeySet(raw, keys, VerifyOptions{Now: now, ClockSkew: time.Minute}); err != nil {
+		t.Fatalf("token inside clock skew rejected: %v", err)
+	}
+	if _, err := VerifyWithKeySet(raw, keys, VerifyOptions{Now: now, ClockSkew: 10 * time.Second}); err == nil {
+		t.Fatal("token outside clock skew accepted")
+	}
+}
+
+func TestVerifyWithKeySet_AcceptsPinnedPreviousKeyDuringOverlap(t *testing.T) {
+	currentPriv := testKey(t)
+	previousPriv := testKey(t)
+	currentPub := PublicKey(currentPriv)
+	previousPub := PublicKey(previousPriv)
+	previousKID := KeyID(previousPub)
+	now := time.Unix(2_000_000_000, 0)
+	tok := &VerifyToken{
+		KeyID: previousKID, Issuer: "issuer", PolicyVersion: 1,
+		LicenseID: "lic", ProductID: "summit", Identifier: "device", Status: "active",
+		Fingerprint: Fingerprint("device", "summit"),
+		IssuedAt:    now.Add(-time.Minute).Unix(), ExpiresAt: now.Add(time.Hour).Unix(),
+	}
+	raw, err := Sign(tok, previousPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := map[string]ed25519.PublicKey{
+		KeyID(currentPub): currentPub,
+		previousKID:       previousPub,
+	}
+	if _, err := VerifyWithKeySet(raw, keys, VerifyOptions{
+		Now: now, Issuer: "issuer", ProductID: "summit", Identifier: "device", MinPolicyVersion: 1,
+	}); err != nil {
+		t.Fatalf("pinned previous key token rejected during overlap: %v", err)
 	}
 }

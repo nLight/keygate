@@ -35,10 +35,38 @@ type LicenseService struct {
 	logger     *slog.Logger
 	failures   FailureTracker
 	webhook    *WebhookService
+	token      LicenseTokenConfig
 }
 
 func NewLicenseService(s *store.Store, signingKey licenseSigningKey, logger *slog.Logger, failures FailureTracker, webhook *WebhookService) *LicenseService {
-	return &LicenseService{store: s, signingKey: signingKey, logger: logger, failures: failures, webhook: webhook}
+	return NewLicenseServiceWithConfig(s, signingKey, logger, failures, webhook, LicenseTokenConfig{})
+}
+
+type LicenseTokenConfig struct {
+	KeyID         string
+	Issuer        string
+	PolicyVersion int
+	TTL           time.Duration
+	GracePeriod   time.Duration
+	Now           func() time.Time
+}
+
+var ErrOfflineTokenUnavailable = errors.New("offline token lifetime is non-positive")
+
+func NewLicenseServiceWithConfig(s *store.Store, signingKey licenseSigningKey, logger *slog.Logger, failures FailureTracker, webhook *WebhookService, tokenCfg LicenseTokenConfig) *LicenseService {
+	if tokenCfg.TTL <= 0 {
+		tokenCfg.TTL = 24 * time.Hour
+	}
+	if tokenCfg.PolicyVersion <= 0 {
+		tokenCfg.PolicyVersion = 1
+	}
+	if tokenCfg.Now == nil {
+		tokenCfg.Now = time.Now
+	}
+	if tokenCfg.KeyID == "" && len(signingKey) == ed25519.PrivateKeySize {
+		tokenCfg.KeyID = license.KeyID(license.PublicKey(signingKey))
+	}
+	return &LicenseService{store: s, signingKey: signingKey, logger: logger, failures: failures, webhook: webhook, token: tokenCfg}
 }
 
 // SigningPublicKey returns the ed25519 public key that pairs with
@@ -47,6 +75,8 @@ func NewLicenseService(s *store.Store, signingKey licenseSigningKey, logger *slo
 func (s *LicenseService) SigningPublicKey() ed25519.PublicKey {
 	return license.PublicKey(s.signingKey)
 }
+
+func (s *LicenseService) SigningKeyID() string { return s.token.KeyID }
 
 // ─── Activate ───
 
@@ -118,6 +148,9 @@ func (s *LicenseService) Activate(ctx context.Context, in ActivateInput) (*Activ
 		middleware.LicenseActivations.WithLabelValues(lic.ProductID, "already_activated").Inc()
 		token, err := s.signToken(lic, in.Identifier)
 		if err != nil {
+			if errors.Is(err, ErrOfflineTokenUnavailable) {
+				return nil, apperr.New(403, "LICENSE_EXPIRED", "license cannot receive an offline token")
+			}
 			return nil, apperr.Internal(err)
 		}
 		return &ActivateResult{
@@ -169,6 +202,9 @@ func (s *LicenseService) Activate(ctx context.Context, in ActivateInput) (*Activ
 
 	token, err := s.signToken(lic, in.Identifier)
 	if err != nil {
+		if errors.Is(err, ErrOfflineTokenUnavailable) {
+			return nil, apperr.New(403, "LICENSE_EXPIRED", "license cannot receive an offline token")
+		}
 		return nil, apperr.Internal(err)
 	}
 
@@ -275,6 +311,9 @@ func (s *LicenseService) Verify(ctx context.Context, in VerifyInput) (*VerifyRes
 
 	token, err := s.signToken(lic, in.Identifier)
 	if err != nil {
+		if errors.Is(err, ErrOfflineTokenUnavailable) {
+			return nil, licenseNotFound()
+		}
 		return nil, apperr.Internal(err)
 	}
 
@@ -505,18 +544,46 @@ func responseMeta() map[string]any {
 }
 
 func (s *LicenseService) signToken(lic *model.License, identifier string) (string, error) {
-	now := time.Now()
+	switch lic.Status {
+	case model.StatusActive, model.StatusTrialing, model.StatusPastDue, model.StatusCanceled:
+		// Lifetime calculation below further constrains canceled/dated rows.
+	default:
+		return "", fmt.Errorf("license status %q cannot receive an offline token", lic.Status)
+	}
+	now := s.token.Now()
+	expiresAt := now.Add(s.token.TTL)
+	validUntil := int64(0)
+	if lic.ValidUntil != nil {
+		validUntil = lic.ValidUntil.Unix()
+		grace := s.token.GracePeriod
+		// Cancellation is effective at the end of the paid period; it must
+		// never gain a fresh offline grace extension.
+		if lic.Status == model.StatusCanceled {
+			grace = 0
+		}
+		licenseDeadline := lic.ValidUntil.Add(grace)
+		if licenseDeadline.Before(expiresAt) {
+			expiresAt = licenseDeadline
+		}
+	}
+	if !expiresAt.After(now) {
+		return "", ErrOfflineTokenUnavailable
+	}
 	t := &license.VerifyToken{
-		LicenseID:   lic.ID,
-		ProductID:   lic.ProductID,
-		PlanID:      lic.PlanID,
-		Status:      lic.Status,
-		Identifier:  identifier,
-		Features:    s.entitlements(lic),
-		IssuedAt:    now.Unix(),
-		ExpiresAt:   now.Add(7 * 24 * time.Hour).Unix(),
-		GraceDays:   s.graceDays(lic),
-		Fingerprint: license.Fingerprint(identifier, lic.ProductID),
+		KeyID:         s.token.KeyID,
+		Issuer:        s.token.Issuer,
+		PolicyVersion: s.token.PolicyVersion,
+		LicenseID:     lic.ID,
+		ProductID:     lic.ProductID,
+		PlanID:        lic.PlanID,
+		Status:        lic.Status,
+		Identifier:    identifier,
+		Features:      s.entitlements(lic),
+		IssuedAt:      now.Unix(),
+		ExpiresAt:     expiresAt.Unix(),
+		ValidUntil:    validUntil,
+		GraceDays:     s.graceDays(lic),
+		Fingerprint:   license.Fingerprint(identifier, lic.ProductID),
 	}
 	return license.Sign(t, s.signingKey)
 }

@@ -80,6 +80,20 @@ var (
 			Help: "Total brute force lockouts triggered",
 		},
 	)
+
+	RateLimitBackendErrors = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "keygate_rate_limit_backend_errors_total",
+			Help: "Redis rate-limit backend failures; affected requests fail closed",
+		},
+	)
+
+	RateLimitRejections = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "keygate_rate_limit_rejections_total",
+			Help: "Requests rejected by configured rate limits",
+		},
+	)
 )
 
 // PrometheusMetrics is a Gin middleware that records HTTP metrics.
