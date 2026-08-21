@@ -27,6 +27,18 @@ func (h *UsageHandler) RecordBillableUsage(c *gin.Context) {
 	h.recordUsage(c, true)
 }
 
+// MaxUsageQuantity bounds a single usage report.
+//
+// The atomic quota check is `currentUsed + quantity > limit` on int64. A
+// caller who sends a quantity near math.MaxInt64 wraps that sum negative, so
+// the check passes and the enforcement is decided by whether PostgreSQL then
+// happens to raise "bigint out of range" — a 500 where a 400 belongs. An
+// unlimited feature (limit == 0) skips the comparison entirely, so on the
+// trusted billing path the same value would be enqueued verbatim as a Stripe
+// meter event. A billion units in one call is already orders of magnitude
+// past any real report and leaves nine orders of headroom before overflow.
+const MaxUsageQuantity = 1_000_000_000
+
 func (h *UsageHandler) recordUsage(c *gin.Context, trustedBilling bool) {
 	var req struct {
 		LicenseKey string         `json:"license_key" binding:"required"`
@@ -36,6 +48,10 @@ func (h *UsageHandler) recordUsage(c *gin.Context, trustedBilling bool) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "license_key and feature are required")
+		return
+	}
+	if req.Quantity > MaxUsageQuantity {
+		response.BadRequest(c, "quantity exceeds the per-call maximum")
 		return
 	}
 
@@ -72,7 +88,6 @@ func (h *UsageHandler) GetQuotaStatus(c *gin.Context) {
 		response.BadRequest(c, "license_key and feature are required")
 		return
 	}
-
 	productID, _ := c.Get("product_id")
 	result, err := h.svc.GetQuotaStatus(c.Request.Context(), req.LicenseKey, req.Feature, str(productID))
 	if err != nil {

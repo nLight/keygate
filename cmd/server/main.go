@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
@@ -195,29 +196,35 @@ func main() {
 				previousReleaseAEAD = crypto.MustDeriveAEAD(previousRaw, "release-signing-private-key")
 			}
 
-			finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			if rotated, err := db.RotateLicenseKeyEncryption(finalizeCtx, previousLicenseAEAD); err != nil {
-				finalizeCancel()
-				log.Fatalf("license key master-key verification/rotation: %v", err)
-			} else if rotated > 0 {
-				logger.Info("license key master-key rotation complete", "rotated", rotated)
-			}
-			if err := db.FinalizeLicenseKeyStorage(finalizeCtx, logger); err != nil {
-				finalizeCancel()
-				log.Fatalf("license key storage finalization: %v", err)
-			}
-			finalizeCancel()
-			logger.Info("license key storage: ciphertext-only")
-
 			releaseAEAD := crypto.MustDeriveAEAD(masterRaw, "release-signing-private-key")
-			rotationCtx, rotationCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			if rotated, err := db.RotateReleaseSigningKeyEncryption(rotationCtx, releaseAEAD, previousReleaseAEAD); err != nil {
-				rotationCancel()
-				log.Fatalf("release signing master-key verification/rotation: %v", err)
-			} else if rotated > 0 {
-				logger.Info("release signing master-key rotation complete", "rotated", rotated)
+
+			// Rotation, plaintext finalization, and the constraint DDL all
+			// mutate shared rows and catalog state. Hold the advisory lock
+			// across the whole sequence so a rolling deploy serialises
+			// instead of racing the ADD CONSTRAINT block.
+			maintenanceCtx, maintenanceCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			err := db.WithKeyMaintenanceLock(maintenanceCtx, func(ctx context.Context) error {
+				if rotated, err := db.RotateLicenseKeyEncryption(ctx, previousLicenseAEAD); err != nil {
+					return fmt.Errorf("license key master-key verification/rotation: %w", err)
+				} else if rotated > 0 {
+					logger.Info("license key master-key rotation complete", "rotated", rotated)
+				}
+				if err := db.FinalizeLicenseKeyStorage(ctx, logger); err != nil {
+					return fmt.Errorf("license key storage finalization: %w", err)
+				}
+				logger.Info("license key storage: ciphertext-only")
+
+				if rotated, err := db.RotateReleaseSigningKeyEncryption(ctx, releaseAEAD, previousReleaseAEAD); err != nil {
+					return fmt.Errorf("release signing master-key verification/rotation: %w", err)
+				} else if rotated > 0 {
+					logger.Info("release signing master-key rotation complete", "rotated", rotated)
+				}
+				return nil
+			})
+			maintenanceCancel()
+			if err != nil {
+				log.Fatalf("startup key maintenance: %v", err)
 			}
-			rotationCancel()
 
 			// Release signing requires storage in addition to the master key.
 			if cfg.IsStorageEnabled() {
@@ -452,8 +459,12 @@ func main() {
 	setupH := handler.NewSetupHandler(db, handler.SetupOptions{
 		Enabled: cfg.SetupEnabled, BootstrapSecret: cfg.BootstrapSecret,
 	})
-	v1.GET("/setup/status", setupH.Status)
-	v1.POST("/setup/initialize", setupH.Initialize)
+	// Both endpoints are unauthenticated and both touch the database.
+	// /setup/initialize additionally guesses at BOOTSTRAP_SECRET, so it gets
+	// the auth-tier budget rather than none at all.
+	setupLimit := middleware.RateLimitByIP(cfg.RateLimitAuth, time.Minute)
+	v1.GET("/setup/status", setupLimit, setupH.Status)
+	v1.POST("/setup/initialize", setupLimit, setupH.Initialize)
 
 	// Public site config (no auth — used by login page, branding)
 	v1.GET("/config", func(c *gin.Context) {

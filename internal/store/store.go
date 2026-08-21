@@ -1445,3 +1445,43 @@ func (s *Store) RotateLicenseKeyEncryption(ctx context.Context, previous *crypto
 		}
 	}
 }
+
+// keyMaintenanceLockID is the advisory-lock key that serialises startup
+// license/release key maintenance across replicas. Distinct from the
+// setup-wizard lock (8675309) and the OTP budget lock (8675311).
+const keyMaintenanceLockID = 8675312
+
+// WithKeyMaintenanceLock runs fn while holding a session-scoped Postgres
+// advisory lock, so exactly one replica performs startup key maintenance.
+//
+// Without it a rolling deploy races: RotateLicenseKeyEncryption's
+// compare-and-swap updates and FinalizeLicenseKeyStorage's
+// "IF NOT EXISTS … ADD CONSTRAINT" block are each individually safe, but two
+// boots can both pass the catalog check and the loser gets a duplicate-object
+// error. main.go treats that as fatal, which turns a normal deploy into a
+// crash loop. Replicas that arrive second block here and then observe the
+// finished state as a no-op.
+//
+// The lock is taken on a dedicated connection so it survives the many
+// pooled statements fn issues, and is released even when fn fails.
+func (s *Store) WithKeyMaintenanceLock(ctx context.Context, fn func(context.Context) error) error {
+	conn, err := s.DB.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("key maintenance lock: acquire connection: %w", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock(?)", keyMaintenanceLockID); err != nil {
+		return fmt.Errorf("key maintenance lock: %w", err)
+	}
+	defer func() {
+		// Best-effort: a dropped connection releases the lock anyway.
+		unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if _, err := conn.ExecContext(unlockCtx, "SELECT pg_advisory_unlock(?)", keyMaintenanceLockID); err != nil {
+			slog.Warn("key maintenance advisory unlock failed", "error", err)
+		}
+	}()
+
+	return fn(ctx)
+}
