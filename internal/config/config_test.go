@@ -83,7 +83,7 @@ func TestValidateSecurityDefaults(t *testing.T) {
 			HTTPWriteTimeout:          time.Second,
 			HTTPIdleTimeout:           time.Second,
 			HTTPMaxHeaderBytes:        1024,
-			ReleaseKeyEncryptionKey:   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			ReleaseKeyEncryptionKey:   strings.Repeat("01", 32),
 		}
 		warnings, fatal := c.ValidateSecurityDefaults()
 		if len(fatal) > 0 {

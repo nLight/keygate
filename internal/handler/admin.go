@@ -2203,15 +2203,36 @@ func (h *AdminHandler) ExportLicenses(c *gin.Context) {
 			validUntil = l.ValidUntil.Format(time.RFC3339)
 		}
 		_ = w.Write([]string{
-			l.ID,
-			l.Email,
-			productName,
-			planName,
-			l.Status,
-			h.Store.DecryptLicenseKey(l),
+			csvCell(l.ID),
+			csvCell(l.Email),
+			csvCell(productName),
+			csvCell(planName),
+			csvCell(l.Status),
+			csvCell(h.Store.DecryptLicenseKey(l)),
 			l.ValidFrom.Format(time.RFC3339),
 			validUntil,
 			l.CreatedAt.Format(time.RFC3339),
 		})
 	}
+}
+
+// csvCell neutralises spreadsheet formula injection.
+//
+// Excel, LibreOffice, and Google Sheets evaluate any cell whose first
+// character is =, +, -, @, or a leading tab/CR as a formula, and DDE payloads
+// such as `=cmd|'/C calc'!A0` execute on open. Several exported columns carry
+// tenant-supplied text: mail.ParseAddress accepts display-name forms, so
+// `=cmd|'/C calc'!A0 <a@b.com>` passes email validation and reaches the file
+// an operator opens. Prefixing with an apostrophe is the standard defence —
+// spreadsheets treat the cell as literal text and the leading quote is not
+// part of the value for anything parsing the CSV as CSV.
+func csvCell(v string) string {
+	if v == "" {
+		return v
+	}
+	switch v[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + v
+	}
+	return v
 }

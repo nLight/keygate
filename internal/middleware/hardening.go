@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"io"
@@ -45,14 +46,22 @@ func BodySizeLimit(maxBytes int64) gin.HandlerFunc {
 // BearerTokenAuth protects operational endpoints such as /metrics and
 // /ready. Empty tokens deny access so a configuration mistake never exposes
 // operational data.
+//
+// Both sides are hashed before comparison. Comparing the raw strings needs a
+// length guard first, and that guard short-circuits — it turns the handler
+// into an oracle for the configured token's length. SHA-256 digests are
+// always 32 bytes, so one ConstantTimeCompare covers every input.
 func BearerTokenAuth(expected string) gin.HandlerFunc {
+	expectedDigest := sha256.Sum256([]byte(expected))
+	configured := expected != ""
 	return func(c *gin.Context) {
 		raw := strings.TrimSpace(c.GetHeader("Authorization"))
 		provided := ""
-		if strings.HasPrefix(strings.ToLower(raw), "bearer ") {
+		if len(raw) >= len("Bearer ") && strings.EqualFold(raw[:len("Bearer ")], "bearer ") {
 			provided = strings.TrimSpace(raw[len("Bearer "):])
 		}
-		if expected == "" || len(provided) != len(expected) || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+		providedDigest := sha256.Sum256([]byte(provided))
+		if !configured || subtle.ConstantTimeCompare(providedDigest[:], expectedDigest[:]) != 1 {
 			c.Header("WWW-Authenticate", "Bearer")
 			abortWithError(c, http.StatusUnauthorized, "UNAUTHORIZED", "operational endpoint authentication required")
 			return

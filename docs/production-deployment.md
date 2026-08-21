@@ -62,6 +62,17 @@ current seed, and remove the previous key only after the overlap expires.
   rate limits closed; alert on `keygate_rate_limit_backend_errors_total`,
   `keygate_rate_limit_rejections_total`, and HTTP 429s, then restore Redis
   rather than bypassing protection.
+- Redis backs the request rate limiter only. The failed-activation lockout
+  (`BF_MAX_FAILS`, `BF_LOCKOUT_SECONDS`) keeps its counters in process memory,
+  so the effective threshold across N replicas is N × `BF_MAX_FAILS` and
+  counters reset on restart. Size `BF_MAX_FAILS` for the replica count, and
+  treat the per-IP rate limit — not the lockout — as the distributed control.
+- Startup key maintenance (master-key rotation, plaintext finalization, and the
+  ciphertext-only constraint DDL) runs under a Postgres advisory lock, so a
+  rolling deploy serialises instead of racing. A replica that starts while
+  another is still finalizing blocks until the work completes, then observes it
+  as a no-op; size deployment readiness timeouts above the time a full
+  rotation takes on your licence table.
 - Encrypt PostgreSQL volumes and backups, enable point-in-time recovery, and
   perform scheduled restore tests. Record RPO/RTO and rollback owners.
 - Use read-only root filesystems, a writable `noexec,nosuid` `/tmp`, dropped
@@ -75,6 +86,12 @@ current seed, and remove the previous key only after the overlap expires.
 Client-reported `/license/usage` updates quota information but cannot enqueue
 Stripe billing events. Billable usage must use the scoped, authenticated
 `POST /api/v1/admin/usage` endpoint with an `Idempotency-Key`.
+
+`GET /api/v1/admin/licenses/export` writes a synchronous audit record before
+returning and prefixes spreadsheet-formula characters (`=`, `+`, `-`, `@`, tab,
+CR) in tenant-supplied columns with an apostrophe. Tools that re-parse the CSV
+should strip that prefix; it exists so a hostile customer email cannot execute
+a formula when an operator opens the export.
 
 The prescribed **Powered by Keygate** UI, email, config-response, and
 `X-Powered-By` attribution is mandatory under the project's AGPL Section 7(b)

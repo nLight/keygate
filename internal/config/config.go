@@ -139,16 +139,24 @@ func Load() (*Config, error) {
 		LicensePreviousPublicKey:  os.Getenv("LICENSE_PREVIOUS_PUBLIC_KEY"),
 		LicensePreviousKeyID:      os.Getenv("LICENSE_PREVIOUS_KEY_ID"),
 		LicenseTokenPolicyVersion: envIntOr("LICENSE_TOKEN_POLICY_VERSION", 1),
-		SetupEnabled:              envBoolOr("SETUP_ENABLED", true),
 		BootstrapSecret:           os.Getenv("BOOTSTRAP_SECRET"),
-		OTPEnabled:                envBoolOr("OTP_ENABLED", true),
 		OTPPepper:                 os.Getenv("OTP_PEPPER"),
 
 		StripeSecretKey:     os.Getenv("STRIPE_SECRET_KEY"),
 		StripeWebhookSecret: os.Getenv("STRIPE_WEBHOOK_SECRET"),
 	}
 	cfg.LicenseTokenIssuer = envOr("LICENSE_TOKEN_ISSUER", cfg.BaseURL)
-	cfg.OTPOpenRegistration = envBoolOr("OTP_OPEN_REGISTRATION", !cfg.IsProduction())
+
+	var err error
+	if cfg.SetupEnabled, err = envBoolOr("SETUP_ENABLED", true); err != nil {
+		return nil, err
+	}
+	if cfg.OTPEnabled, err = envBoolOr("OTP_ENABLED", true); err != nil {
+		return nil, err
+	}
+	if cfg.OTPOpenRegistration, err = envBoolOr("OTP_OPEN_REGISTRATION", !cfg.IsProduction()); err != nil {
+		return nil, err
+	}
 	if domains := os.Getenv("OTP_ALLOWED_DOMAINS"); domains != "" {
 		for _, domain := range strings.Split(domains, ",") {
 			domain = strings.ToLower(strings.TrimSpace(domain))
@@ -165,7 +173,6 @@ func Load() (*Config, error) {
 		cfg.LicensePreviousKeyValidUntil = parsed
 	}
 
-	var err error
 	if cfg.OfflineTokenTTL, err = envDurationOr("OFFLINE_TOKEN_TTL", "24h"); err != nil {
 		return nil, err
 	}
@@ -454,16 +461,22 @@ func envFloatOr(key string, fallback float64) float64 {
 	return fallback
 }
 
-func envBoolOr(key string, fallback bool) bool {
+// envBoolOr parses a boolean env var, failing closed on garbage.
+//
+// Returning the fallback for an unparsable value is the wrong default for a
+// security switch: a typo in SETUP_ENABLED or OTP_OPEN_REGISTRATION would
+// silently leave first-run bootstrap or open registration enabled instead of
+// stopping the boot. The operator has to fix the value.
+func envBoolOr(key string, fallback bool) (bool, error) {
 	v, ok := os.LookupEnv(key)
 	if !ok || strings.TrimSpace(v) == "" {
-		return fallback
+		return fallback, nil
 	}
 	b, err := strconv.ParseBool(strings.TrimSpace(v))
 	if err != nil {
-		return fallback
+		return false, fmt.Errorf("%s must be a boolean (true/false/1/0), got %q", key, v)
 	}
-	return b
+	return b, nil
 }
 
 func envDurationOr(key, fallback string) (time.Duration, error) {

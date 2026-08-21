@@ -76,15 +76,49 @@ func NewWebhookServiceWithConfig(s *store.Store, logger *slog.Logger, cfg Webhoo
 	return svc
 }
 
+// forbiddenWebhookNets covers the internal ranges net.IP's own predicates miss.
+// Parsed once: isForbiddenWebhookIP runs on every resolved address of every
+// delivery and every redirect hop.
+//
+//   - 0.0.0.0/8      "this network"; 0.x.y.z reaches 127.0.0.1 on Linux.
+//   - 100.64.0.0/10  carrier-grade NAT, not covered by IsPrivate.
+//   - 192.0.0.0/24   IETF protocol assignments (includes NAT64 well-known).
+//   - 198.18.0.0/15  benchmarking range, routed internally in many networks.
+//   - 2002::/16      6to4; the embedded IPv4 can be any internal address.
+//   - 64:ff9b::/96   NAT64 well-known prefix; same embedding problem.
+//   - 64:ff9b:1::/48 local-use NAT64 prefix.
+var forbiddenWebhookNets = func() []*net.IPNet {
+	cidrs := []string{
+		"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15",
+		"2002::/16", "64:ff9b::/96", "64:ff9b:1::/48",
+	}
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			panic("webhook blocklist: " + c + ": " + err.Error())
+		}
+		out = append(out, n)
+	}
+	return out
+}()
+
 func isForbiddenWebhookIP(ip net.IP) bool {
 	if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() ||
+		ip.IsUnspecified() {
 		return true
 	}
-	// Carrier-grade NAT is not classified private by net.IP.IsPrivate, but it
-	// is still an internal destination and must not receive tenant webhooks.
-	_, cgnat, _ := net.ParseCIDR("100.64.0.0/10")
-	return cgnat.Contains(ip)
+	// Normalise 4-in-6 (::ffff:10.0.0.1) so the IPv4 ranges below match it.
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	for _, n := range forbiddenWebhookNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func safeWebhookDialer(ctx context.Context, network, address string) (net.Conn, error) {

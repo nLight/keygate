@@ -1,0 +1,26 @@
+title = "Keygate secret scanning"
+
+# Start from the bundled ruleset — this file only ever narrows it.
+[extend]
+useDefault = true
+
+[allowlist]
+description = """
+Synthetic key material used by tests. The values below are placeholder byte
+patterns, never credentials, but they are valid-length hex so the generic
+high-entropy rule matches them.
+
+Scoped to the literal placeholder sequences rather than to test paths on
+purpose: allowlisting *_test.go wholesale would hide a real credential that
+someone pastes into a fixture. A pattern like a repeated "0123456789abcdef" run
+cannot be a live key.
+
+History is scanned on every pull request, so an entry is still needed after the
+working tree is cleaned up — the fixture stays in the commit that introduced it.
+"""
+regexes = [
+  # Repeated nibble-ladder fixtures, e.g. the 64-char master/signing key
+  # stand-ins in internal/config/config_test.go.
+  # gitleaks compiles with RE2, so no backreferences here.
+  '''^(?:0123456789abcdef)+$''',
+]
