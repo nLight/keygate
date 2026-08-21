@@ -1730,11 +1730,25 @@ func (h *AdminHandler) ChangeLicensePlan(c *gin.Context) {
 
 // ─── Settings ───
 
+// internalSettingKeys are written by the server itself during first-run
+// setup. They must not round-trip through the admin settings form: the UI
+// loads GET /admin/settings straight into form state and posts the whole
+// map back, so anything exposed here has to be writable — these are not.
+// setup_bootstrap_consumed_at in particular is an audit trail of when the
+// bootstrap secret was spent.
+var internalSettingKeys = map[string]bool{
+	"setup_complete":              true,
+	"setup_bootstrap_consumed_at": true,
+}
+
 func (h *AdminHandler) GetSettings(c *gin.Context) {
 	settings, err := h.Store.GetSettings(c)
 	if err != nil {
 		response.Internal(c)
 		return
+	}
+	for key := range internalSettingKeys {
+		delete(settings, key)
 	}
 	response.OK(c, gin.H{"settings": settings})
 }
@@ -1756,7 +1770,6 @@ func (h *AdminHandler) UpdateSettings(c *gin.Context) {
 		"rate_limit_api": true, "rate_limit_admin": true,
 		"webhook_max_attempts": true, "webhook_timeout": true,
 		"quota_warning_threshold":          true,
-		"setup_complete":                   true,
 		"email_template_license_created":   true,
 		"email_template_license_expiring":  true,
 		"email_template_license_expired":   true,
@@ -1766,20 +1779,28 @@ func (h *AdminHandler) UpdateSettings(c *gin.Context) {
 		"email_template_seat_invite":       true,
 		"email_template_payment_failed":    true,
 	}
-	for key := range req.Settings {
+	// Server-owned keys are dropped rather than rejected: the UI posts back
+	// everything GET returned, so a 400 on one of them would block every
+	// unrelated setting on the page.
+	updates := make(map[string]string, len(req.Settings))
+	for key, value := range req.Settings {
+		if internalSettingKeys[key] {
+			continue
+		}
 		if !allowed[key] {
 			response.BadRequest(c, "unknown setting: "+key)
 			return
 		}
+		updates[key] = value
 	}
 
-	if err := h.Store.SetSettings(c, req.Settings); err != nil {
+	if err := h.Store.SetSettings(c, updates); err != nil {
 		response.Internal(c)
 		return
 	}
 
-	keys := make([]string, 0, len(req.Settings))
-	for k := range req.Settings {
+	keys := make([]string, 0, len(updates))
+	for k := range updates {
 		keys = append(keys, k)
 	}
 	h.Store.Audit(c, &model.AuditLog{
