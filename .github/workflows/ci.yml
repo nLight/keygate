@@ -106,6 +106,9 @@ jobs:
           # failed before scanning anything. Pushes to main never hit that path,
           # which is why the gap only shows up on pull requests.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Point at the repo config explicitly rather than relying on
+          # gitleaks' working-directory auto-discovery.
+          GITLEAKS_CONFIG: .gitleaks.toml
 
   codeql:
     name: CodeQL
