@@ -110,12 +110,26 @@ paths:
                       algorithm:
                         type: string
                         enum: [ed25519]
+                      kid:
+                        type: string
+                        description: Signing-key identifier included in token claims
                       format:
                         type: string
                         enum: [hex]
                       public_key:
                         type: string
                         description: 32-byte Ed25519 public key, hex-encoded (64 chars)
+
+  /license/keys:
+    get:
+      tags: [License]
+      summary: Get current and overlap license verification keys
+      description: |
+        Rotation metadata for clients that already have a pinned trust anchor.
+        This endpoint must not be treated as first-use trust.
+      responses:
+        "200":
+          description: Current token policy and published key set
 
   /license/activate:
     post:
@@ -283,9 +297,11 @@ paths:
   /license/usage:
     post:
       tags: [Usage]
-      summary: Record usage
+      summary: Record informational client usage
       description: |
-        Increments a usage counter for a metered feature.
+        Increments a usage counter for a metered feature. This client-held
+        license-key path never enqueues financial billing events; trusted
+        billable usage uses the authenticated `/admin/usage` endpoint.
         The increment is **atomic** — concurrent requests will never exceed the quota.
 
         Returns the updated counter with remaining balance.

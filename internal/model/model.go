@@ -268,17 +268,23 @@ type Entitlement struct {
 type License struct {
 	bun.BaseModel `bun:"table:licenses"`
 
-	ID         string `bun:",pk" json:"id"`
-	ProductID  string `bun:",notnull" json:"product_id"`
-	PlanID     string `bun:",notnull" json:"plan_id"`
-	UserID     string `bun:",nullzero" json:"user_id,omitempty"`
-	Email      string `bun:",notnull" json:"email"`
-	LicenseKey string `bun:",notnull,unique" json:"license_key"`
-	KeyHash    string `bun:",notnull,default:''" json:"-"` // never exposed in API
+	ID        string `bun:",pk" json:"id"`
+	ProductID string `bun:",notnull" json:"product_id"`
+	PlanID    string `bun:",notnull" json:"plan_id"`
+	UserID    string `bun:",nullzero" json:"user_id,omitempty"`
+	Email     string `bun:",notnull" json:"email"`
+	// LicenseKey is transient input / one-time reveal data. It is never mapped
+	// to the legacy database column; persistent lookup uses KeyHash and reveal
+	// uses LicenseKeyEncrypted.
+	LicenseKey string `bun:"-" json:"license_key,omitempty"`
+	// LicenseKeyPlaintext maps the nullable legacy column only so startup can
+	// complete the staged ciphertext backfill. Fresh writes always leave it nil.
+	LicenseKeyPlaintext *string `bun:"license_key" json:"-"`
+	KeyHash             string  `bun:",notnull,default:''" json:"-"` // never exposed in API
 	// LicenseKeyEncrypted stores the license key encrypted at rest under
-	// HKDF("license-key") subkey of the master encryption key. Phase A:
-	// new rows have it populated alongside LicenseKey. Phase B will
-	// backfill existing rows. Phase C will drop the plaintext column.
+	// HKDF("license-key") subkey of the master encryption key. New rows
+	// populate only ciphertext; startup permanently nulls legacy plaintext
+	// after verifying hash and ciphertext coverage.
 	// Always JSON-hidden; decrypt path is store.DecryptLicenseKey.
 	LicenseKeyEncrypted []byte `bun:",nullzero" json:"-"`
 

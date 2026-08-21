@@ -1,9 +1,19 @@
 package middleware
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
+
+type fakeRedisClient struct{ cmd *redis.Cmd }
+
+func (f fakeRedisClient) Eval(context.Context, string, []string, ...interface{}) *redis.Cmd {
+	return f.cmd
+}
 
 func TestMemoryBackendAllow(t *testing.T) {
 	mb := NewMemoryBackend().(*memoryBackend)
@@ -70,5 +80,16 @@ func TestMemoryBackendCleanup(t *testing.T) {
 
 	if exists {
 		t.Fatal("old-key should be cleaned up")
+	}
+}
+
+func TestRedisBackendFailsClosed(t *testing.T) {
+	failed := NewRedisBackend(fakeRedisClient{cmd: redis.NewCmdResult(nil, errors.New("redis down"))})
+	if failed.Allow("auth:user", 10, time.Minute) {
+		t.Fatal("Redis errors must deny rather than silently disabling the limit")
+	}
+	allowed := NewRedisBackend(fakeRedisClient{cmd: redis.NewCmdResult(int64(1), nil)})
+	if !allowed.Allow("auth:user", 10, time.Minute) {
+		t.Fatal("count below limit should be allowed")
 	}
 }

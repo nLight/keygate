@@ -1,39 +1,95 @@
 services:
   keygate:
-    image: ghcr.io/tabloy/keygate:latest
+    image: ${KEYGATE_IMAGE:?Set an immutable ghcr.io/tabloy/keygate@sha256 image reference}
     # build: .  # uncomment to build from source
     ports:
-      - "9000:9000"
+      # Bind privately; terminate TLS and enforce matching body/header limits
+      # at a maintained reverse proxy on the same host/network.
+      - "127.0.0.1:9000:9000"
     environment:
       PORT: "9000"
       ENVIRONMENT: production
-      BASE_URL: http://localhost:9000
-      DATABASE_URL: postgres://keygate:keygate@postgres:5432/keygate?sslmode=disable
+      BASE_URL: ${BASE_URL:?Set the public https BASE_URL}
+      DATABASE_URL: postgres://keygate:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/keygate?sslmode=disable
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       LICENSE_SIGNING_KEY: ${LICENSE_SIGNING_KEY:?Set LICENSE_SIGNING_KEY in .env}
+      LICENSE_SIGNING_KEY_ID: ${LICENSE_SIGNING_KEY_ID:-}
+      LICENSE_PREVIOUS_PUBLIC_KEY: ${LICENSE_PREVIOUS_PUBLIC_KEY:-}
+      LICENSE_PREVIOUS_KEY_ID: ${LICENSE_PREVIOUS_KEY_ID:-}
+      LICENSE_PREVIOUS_KEY_VALID_UNTIL: ${LICENSE_PREVIOUS_KEY_VALID_UNTIL:-}
+      LICENSE_TOKEN_ISSUER: ${LICENSE_TOKEN_ISSUER:-}
+      LICENSE_TOKEN_POLICY_VERSION: ${LICENSE_TOKEN_POLICY_VERSION:-1}
+      OFFLINE_TOKEN_TTL: ${OFFLINE_TOKEN_TTL:-24h}
+      OFFLINE_GRACE_PERIOD: ${OFFLINE_GRACE_PERIOD:-0s}
+      OFFLINE_CLOCK_SKEW: ${OFFLINE_CLOCK_SKEW:-2m}
+      RELEASE_KEY_ENCRYPTION_KEY: ${RELEASE_KEY_ENCRYPTION_KEY:?Set RELEASE_KEY_ENCRYPTION_KEY in .env}
+      RELEASE_KEY_ENCRYPTION_PREVIOUS_KEY: ${RELEASE_KEY_ENCRYPTION_PREVIOUS_KEY:-}
+      SETUP_ENABLED: ${SETUP_ENABLED:-false}
+      BOOTSTRAP_SECRET: ${BOOTSTRAP_SECRET:-}
+      OTP_ENABLED: ${OTP_ENABLED:-true}
+      OTP_PEPPER: ${OTP_PEPPER:?Set OTP_PEPPER in .env}
+      OTP_OPEN_REGISTRATION: ${OTP_OPEN_REGISTRATION:-false}
+      OTP_ALLOWED_DOMAINS: ${OTP_ALLOWED_DOMAINS:-}
+      METRICS_TOKEN: ${METRICS_TOKEN:?Set METRICS_TOKEN in .env}
+      REDIS_URL: redis://redis:6379/0
       ADMIN_EMAILS: ${ADMIN_EMAILS:-}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_LIVEMODE: ${STRIPE_LIVEMODE:-false}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM: ${SMTP_FROM:-}
+      MAX_REQUEST_BODY_KB: ${MAX_REQUEST_BODY_KB:-1024}
+      STRIPE_WEBHOOK_MAX_KB: ${STRIPE_WEBHOOK_MAX_KB:-256}
+      HTTP_READ_HEADER_TIMEOUT: ${HTTP_READ_HEADER_TIMEOUT:-5s}
+      HTTP_READ_TIMEOUT: ${HTTP_READ_TIMEOUT:-15s}
+      HTTP_WRITE_TIMEOUT: ${HTTP_WRITE_TIMEOUT:-30s}
+      HTTP_IDLE_TIMEOUT: ${HTTP_IDLE_TIMEOUT:-60s}
+      HTTP_MAX_HEADER_KB: ${HTTP_MAX_HEADER_KB:-32}
+      RATE_LIMIT_API: ${RATE_LIMIT_API:-60}
+      RATE_LIMIT_ADMIN: ${RATE_LIMIT_ADMIN:-120}
+      RATE_LIMIT_AUTH: ${RATE_LIMIT_AUTH:-20}
+      BF_MAX_FAILS: ${BF_MAX_FAILS:-5}
+      BF_LOCKOUT_SECONDS: ${BF_LOCKOUT_SECONDS:-30}
+      WEBHOOK_MAX_ATTEMPTS: ${WEBHOOK_MAX_ATTEMPTS:-5}
+      WEBHOOK_RETRY_INTERVAL: ${WEBHOOK_RETRY_INTERVAL:-30s}
+      WEBHOOK_HTTP_TIMEOUT: ${WEBHOOK_HTTP_TIMEOUT:-10s}
+      QUOTA_WARNING_THRESHOLD: ${QUOTA_WARNING_THRESHOLD:-0.8}
+      STORAGE_ENDPOINT: ${STORAGE_ENDPOINT:-}
+      STORAGE_REGION: ${STORAGE_REGION:-auto}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-}
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:-}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:-}
+      STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-false}
+      STORAGE_UPLOAD_TTL: ${STORAGE_UPLOAD_TTL:-1h}
+      STORAGE_DOWNLOAD_TTL: ${STORAGE_DOWNLOAD_TTL:-10m}
+      MAX_RELEASE_SIGN_SIZE_MB: ${MAX_RELEASE_SIGN_SIZE_MB:-500}
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9000/health"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
 
   postgres:
-    image: postgres:18-alpine
+    image: postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2
     environment:
       POSTGRES_USER: keygate
-      POSTGRES_PASSWORD: keygate
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
       POSTGRES_DB: keygate
     volumes:
       # postgres:18+ images expect the volume mounted at /var/lib/postgresql
@@ -46,6 +102,21 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /data:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   pgdata:

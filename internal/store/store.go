@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -436,21 +437,12 @@ func (s *Store) TouchAPIKey(id, ip string) {
 
 // DecryptLicenseKey returns the plaintext license key for a row.
 //
-// Read order:
-//  1. If LicenseKeyEncrypted is populated AND the AEAD is configured,
-//     decrypt and return that. Failure logs at WARN + bumps the
-//     LicenseKeyDecryptFailures metric so ops can detect ciphertext
-//     corruption (and, post-Phase C, the empty-result that follows).
-//     We still fall back to plaintext during Phase A/B so a corrupted row
-//     doesn't black-hole the license; Phase C drops the plaintext column,
-//     after which a decrypt failure surfaces as an empty key — which the
-//     metric makes visible.
-//  2. Else return LicenseKey (plaintext column) — used during transition
-//     for un-migrated rows and when encryption is unconfigured.
+// There is deliberately no plaintext fallback. A missing master key or damaged
+// ciphertext fails closed and increments an operational metric.
 //
 // Callers that need to display the key (admin API, customer portal,
 // post-purchase email) MUST go through this path rather than reading
-// model.License.LicenseKey directly. Phase C will null those direct reads.
+// model.License.LicenseKey directly.
 func (s *Store) DecryptLicenseKey(l *model.License) string {
 	if l == nil {
 		return ""
@@ -458,16 +450,23 @@ func (s *Store) DecryptLicenseKey(l *model.License) string {
 	if s.LicenseKeyAEAD != nil && len(l.LicenseKeyEncrypted) > 0 {
 		pt, err := s.LicenseKeyAEAD.Decrypt(l.LicenseKeyEncrypted, []byte(l.ID))
 		if err == nil {
-			return string(pt)
+			plaintext := string(pt)
+			clear(pt)
+			return plaintext
 		}
-		slog.Warn("license key decrypt failed; falling back to plaintext column",
+		slog.Warn("license key decrypt failed",
 			"license_id", l.ID,
 			"ciphertext_bytes", len(l.LicenseKeyEncrypted),
 			"error", err)
 		// metric bump — observable via /metrics
 		licenseKeyDecryptFailuresInc()
+	} else {
+		slog.Warn("license key decrypt unavailable", "license_id", l.ID,
+			"ciphertext_present", len(l.LicenseKeyEncrypted) > 0,
+			"master_key_configured", s.LicenseKeyAEAD != nil)
+		licenseKeyDecryptFailuresInc()
 	}
-	return l.LicenseKey
+	return ""
 }
 
 // prepareLicenseForInsert fills in the derived fields a license needs at
@@ -481,14 +480,19 @@ func (s *Store) prepareLicenseForInsert(l *model.License) error {
 	if l.ID == "" {
 		l.ID = newID()
 	}
-	l.KeyHash = license.HashKey(l.LicenseKey)
-	if s.LicenseKeyAEAD != nil && l.LicenseKey != "" {
-		ct, err := s.LicenseKeyAEAD.Encrypt([]byte(l.LicenseKey), []byte(l.ID))
-		if err != nil {
-			return fmt.Errorf("encrypt license key: %w", err)
-		}
-		l.LicenseKeyEncrypted = ct
+	if l.LicenseKey == "" {
+		return errors.New("license key is required")
 	}
+	if s.LicenseKeyAEAD == nil {
+		return errors.New("license key encryption is not configured")
+	}
+	l.KeyHash = license.HashKey(l.LicenseKey)
+	ct, err := s.LicenseKeyAEAD.Encrypt([]byte(l.LicenseKey), []byte(l.ID))
+	if err != nil {
+		return fmt.Errorf("encrypt license key: %w", err)
+	}
+	l.LicenseKeyEncrypted = ct
+	l.LicenseKeyPlaintext = nil
 	return nil
 }
 
@@ -548,19 +552,7 @@ func (s *Store) FindLicenseByKey(ctx context.Context, key string) (*model.Licens
 		Relation("Activations").
 		Where("license.key_hash = ?", keyHash).
 		Scan(ctx)
-	if err != nil {
-		// Fallback to plaintext for un-migrated keys — use fresh model
-		// to avoid mixing partial state from the failed hash lookup.
-		l = new(model.License)
-		return l, s.DB.NewSelect().Model(l).
-			Relation("Product").
-			Relation("Plan").
-			Relation("Plan.Entitlements").
-			Relation("Activations").
-			Where("license.license_key = ?", key).
-			Scan(ctx)
-	}
-	return l, nil
+	return l, err
 }
 
 func (s *Store) FindLicenseByStripeSubscription(ctx context.Context, subID string) (*model.License, error) {
@@ -766,6 +758,17 @@ func (s *Store) Audit(ctx context.Context, log *model.AuditLog) {
 	}()
 }
 
+// AuditSync is used for high-impact reads (for example bulk exports) where the
+// audit record is part of the authorization contract rather than best-effort
+// telemetry. The caller should fail the operation if this write fails.
+func (s *Store) AuditSync(ctx context.Context, log *model.AuditLog) error {
+	if log.ID == "" {
+		log.ID = newID()
+	}
+	_, err := s.DB.NewInsert().Model(log).Exec(ctx)
+	return err
+}
+
 // FindLicensesForGraceExpiry returns active/past_due licenses that have passed valid_until.
 func (s *Store) FindLicensesForGraceExpiry(ctx context.Context) ([]*model.License, error) {
 	var out []*model.License
@@ -962,40 +965,108 @@ func (s *Store) CreateOTPCode(ctx context.Context, otp *model.OTPCode) error {
 	return err
 }
 
-func (s *Store) CountRecentOTPCodes(ctx context.Context, email string) (int, error) {
-	count, err := s.DB.NewSelect().Model((*model.OTPCode)(nil)).
-		Where("email = ? AND created_at > now() - interval '10 minutes'", email).
+// CreateOTPCodeWithLimit serializes the per-email delivery budget across all
+// application instances. The transaction advisory lock closes the race between
+// counting recent rows and inserting the next verifier.
+func (s *Store) CreateOTPCodeWithLimit(ctx context.Context, otp *model.OTPCode, limit int) (bool, error) {
+	if otp == nil || otp.Email == "" || limit <= 0 {
+		return false, errors.New("invalid OTP delivery limit input")
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.NewRaw("SELECT pg_advisory_xact_lock(hashtextextended(?, 8675311))", otp.Email).Exec(ctx); err != nil {
+		return false, err
+	}
+	count, err := tx.NewSelect().Model((*model.OTPCode)(nil)).
+		Where("email = ? AND created_at > now() - interval '10 minutes'", otp.Email).
 		Count(ctx)
-	return count, err
+	if err != nil {
+		return false, err
+	}
+	if count >= limit {
+		return false, nil
+	}
+	if otp.ID == "" {
+		otp.ID = newID()
+	}
+	if _, err := tx.NewInsert().Model(otp).Exec(ctx); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-func (s *Store) FindLatestValidOTPCode(ctx context.Context, email string) (*model.OTPCode, error) {
+// ConsumeOTPCode serializes verification of the newest usable code for an
+// email address. The row lock, attempt increment, and used transition happen
+// in one transaction, so parallel submissions cannot create two sessions or
+// bypass the attempt budget.
+func (s *Store) ConsumeOTPCode(ctx context.Context, email, candidateVerifier, dummyVerifier string) (*model.OTPCode, bool, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback()
+
 	otp := new(model.OTPCode)
-	err := s.DB.NewSelect().Model(otp).
+	err = tx.NewSelect().Model(otp).
 		Where("email = ?", email).
 		Where("used = false").
 		Where("expires_at > now()").
 		Where("attempts < 5").
 		OrderExpr("created_at DESC").
 		Limit(1).
+		For("UPDATE").
 		Scan(ctx)
-	return otp, err
-}
+	if errors.Is(err, sql.ErrNoRows) {
+		// Keep the no-row path computationally comparable to a real verifier.
+		_ = hmac.Equal([]byte(candidateVerifier), []byte(dummyVerifier))
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
 
-func (s *Store) IncrementOTPAttempts(ctx context.Context, id string) error {
-	_, err := s.DB.NewUpdate().Model((*model.OTPCode)(nil)).
+	matched := hmac.Equal([]byte(candidateVerifier), []byte(otp.CodeHash))
+	q := tx.NewUpdate().Model((*model.OTPCode)(nil)).
 		Set("attempts = attempts + 1").
-		Where("id = ?", id).
-		Exec(ctx)
-	return err
+		Where("id = ? AND used = false AND attempts < 5", otp.ID)
+	if matched {
+		q = q.Set("used = true")
+	}
+	res, err := q.Exec(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return nil, false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, err
+	}
+	otp.Attempts++
+	otp.Used = matched
+	return otp, matched, nil
 }
 
-func (s *Store) MarkOTPUsed(ctx context.Context, id string) error {
-	_, err := s.DB.NewUpdate().Model((*model.OTPCode)(nil)).
-		Set("used = true").
-		Where("id = ?", id).
-		Exec(ctx)
-	return err
+// IsOTPRecipientKnown implements closed-registration eligibility using only
+// server-side records. Invitations (seats), existing users, and licenses all
+// qualify; callers may additionally allow configured email domains.
+func (s *Store) IsOTPRecipientKnown(ctx context.Context, email string) (bool, error) {
+	var allowed bool
+	err := s.DB.NewRaw(`
+		SELECT EXISTS (
+			SELECT 1 FROM users WHERE lower(email) = ?
+			UNION ALL
+			SELECT 1 FROM licenses WHERE lower(email) = ?
+			UNION ALL
+			SELECT 1 FROM seats WHERE lower(email) = ? AND removed_at IS NULL
+		)`, email, email, email).Scan(ctx, &allowed)
+	return allowed, err
 }
 
 func (s *Store) CleanExpiredOTPs(ctx context.Context) {
@@ -1139,7 +1210,10 @@ func (s *Store) BackfillKeyHashes(ctx context.Context) error {
 		return err
 	}
 	for _, l := range licenses {
-		l.KeyHash = license.HashKey(l.LicenseKey)
+		if l.LicenseKeyPlaintext == nil || *l.LicenseKeyPlaintext == "" {
+			return fmt.Errorf("license %s is missing both key_hash and legacy plaintext", l.ID)
+		}
+		l.KeyHash = license.HashKey(*l.LicenseKeyPlaintext)
 		_, err := s.DB.NewUpdate().Model(l).Column("key_hash").WherePK().Exec(ctx)
 		if err != nil {
 			return err
@@ -1202,7 +1276,11 @@ func (s *Store) BackfillLicenseKeyEncrypted(ctx context.Context, logger *slog.Lo
 			break
 		}
 		for _, l := range batch {
-			ct, err := s.LicenseKeyAEAD.Encrypt([]byte(l.LicenseKey), []byte(l.ID))
+			if l.LicenseKeyPlaintext == nil || *l.LicenseKeyPlaintext == "" {
+				return total, fmt.Errorf("license %s is missing legacy plaintext for ciphertext backfill", l.ID)
+			}
+			plain := *l.LicenseKeyPlaintext
+			ct, err := s.LicenseKeyAEAD.Encrypt([]byte(plain), []byte(l.ID))
 			if err != nil {
 				logger.Warn("license key backfill: encrypt failed; skipping",
 					"license_id", l.ID, "error", err)
@@ -1215,7 +1293,7 @@ func (s *Store) BackfillLicenseKeyEncrypted(ctx context.Context, logger *slog.Lo
 			// skip — the next backfill picks up the new plaintext.
 			res, err := s.DB.NewUpdate().Model((*model.License)(nil)).
 				Set("license_key_encrypted = ?", ct).
-				Where("id = ? AND license_key = ? AND license_key_encrypted IS NULL", l.ID, l.LicenseKey).
+				Where("id = ? AND license_key = ? AND license_key_encrypted IS NULL", l.ID, plain).
 				Exec(ctx)
 			if err != nil {
 				logger.Warn("license key backfill: update failed; skipping",
@@ -1250,4 +1328,120 @@ func (s *Store) countLicenseKeysUnencrypted(ctx context.Context) (int, error) {
 	return s.DB.NewSelect().Model((*model.License)(nil)).
 		Where("license_key_encrypted IS NULL AND license_key <> ''").
 		Count(ctx)
+}
+
+// FinalizeLicenseKeyStorage is the blocking startup gate for ciphertext-only
+// storage. It is restart-safe: every step is idempotent, plaintext is cleared
+// only after complete hash+ciphertext coverage, and database constraints are
+// validated last.
+func (s *Store) FinalizeLicenseKeyStorage(ctx context.Context, logger *slog.Logger) error {
+	if s.LicenseKeyAEAD == nil {
+		return errors.New("license key encryption is not configured")
+	}
+	if err := s.BackfillKeyHashes(ctx); err != nil {
+		return fmt.Errorf("backfill license key hashes: %w", err)
+	}
+	if _, err := s.BackfillLicenseKeyEncrypted(ctx, logger); err != nil {
+		return fmt.Errorf("backfill license key ciphertext: %w", err)
+	}
+
+	missing, err := s.DB.NewSelect().Model((*model.License)(nil)).
+		Where("key_hash = '' OR license_key_encrypted IS NULL").Count(ctx)
+	if err != nil {
+		return fmt.Errorf("verify license key coverage: %w", err)
+	}
+	if missing != 0 {
+		return fmt.Errorf("refusing to clear plaintext: %d license rows lack hash or ciphertext", missing)
+	}
+	if _, err := s.DB.NewRaw("UPDATE licenses SET license_key = NULL WHERE license_key IS NOT NULL").Exec(ctx); err != nil {
+		return fmt.Errorf("clear legacy plaintext: %w", err)
+	}
+	var plaintextRows int
+	if err := s.DB.NewRaw("SELECT count(*) FROM licenses WHERE license_key IS NOT NULL").Scan(ctx, &plaintextRows); err != nil {
+		return fmt.Errorf("verify plaintext removal: %w", err)
+	}
+	if plaintextRows != 0 {
+		return fmt.Errorf("plaintext license keys remain: %d rows", plaintextRows)
+	}
+
+	if _, err := s.DB.NewRaw(`
+		DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'licenses_key_plaintext_absent') THEN
+				ALTER TABLE licenses ADD CONSTRAINT licenses_key_plaintext_absent CHECK (license_key IS NULL) NOT VALID;
+			END IF;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'licenses_key_hash_present') THEN
+				ALTER TABLE licenses ADD CONSTRAINT licenses_key_hash_present CHECK (key_hash <> '') NOT VALID;
+			END IF;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'licenses_key_ciphertext_present') THEN
+				ALTER TABLE licenses ADD CONSTRAINT licenses_key_ciphertext_present CHECK (license_key_encrypted IS NOT NULL) NOT VALID;
+			END IF;
+		END $$;
+		ALTER TABLE licenses VALIDATE CONSTRAINT licenses_key_plaintext_absent;
+		ALTER TABLE licenses VALIDATE CONSTRAINT licenses_key_hash_present;
+		ALTER TABLE licenses VALIDATE CONSTRAINT licenses_key_ciphertext_present;
+	`).Exec(ctx); err != nil {
+		return fmt.Errorf("validate ciphertext-only constraints: %w", err)
+	}
+	LicenseKeysUnencrypted.Set(0)
+	return nil
+}
+
+// RotateLicenseKeyEncryption verifies every stored ciphertext under the
+// current master key. When previous is provided, rows that only decrypt under
+// it are re-encrypted under the current key with a compare-and-swap update.
+// The operation is idempotent and therefore safe to resume after interruption.
+func (s *Store) RotateLicenseKeyEncryption(ctx context.Context, previous *crypto.AESGCM) (int, error) {
+	if s.LicenseKeyAEAD == nil {
+		return 0, errors.New("current license key encryption is not configured")
+	}
+	const batchSize = 100
+	lastID := ""
+	rotated := 0
+	for {
+		var batch []*model.License
+		q := s.DB.NewSelect().Model(&batch).
+			Column("id", "license_key_encrypted").
+			Where("license_key_encrypted IS NOT NULL").
+			OrderExpr("id ASC").Limit(batchSize)
+		if lastID != "" {
+			q = q.Where("id > ?", lastID)
+		}
+		if err := q.Scan(ctx); err != nil {
+			return rotated, err
+		}
+		if len(batch) == 0 {
+			return rotated, nil
+		}
+		for _, l := range batch {
+			lastID = l.ID
+			if _, err := s.LicenseKeyAEAD.Decrypt(l.LicenseKeyEncrypted, []byte(l.ID)); err == nil {
+				continue
+			}
+			if previous == nil {
+				return rotated, fmt.Errorf("license %s ciphertext cannot be decrypted with the current master key", l.ID)
+			}
+			plain, err := previous.Decrypt(l.LicenseKeyEncrypted, []byte(l.ID))
+			if err != nil {
+				return rotated, fmt.Errorf("license %s ciphertext cannot be decrypted with current or previous master key", l.ID)
+			}
+			fresh, err := s.LicenseKeyAEAD.Encrypt(plain, []byte(l.ID))
+			clear(plain)
+			if err != nil {
+				return rotated, err
+			}
+			res, err := s.DB.NewUpdate().Model((*model.License)(nil)).
+				Set("license_key_encrypted = ?", fresh).
+				Where("id = ? AND license_key_encrypted = ?", l.ID, l.LicenseKeyEncrypted).
+				Exec(ctx)
+			if err != nil {
+				return rotated, err
+			}
+			if n, _ := res.RowsAffected(); n == 1 {
+				rotated++
+			}
+		}
+		if len(batch) < batchSize {
+			return rotated, nil
+		}
+	}
 }

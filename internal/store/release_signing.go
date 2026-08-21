@@ -2,11 +2,14 @@ package store
 
 import (
 	"context"
+	"crypto/ed25519"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
 
+	keycrypto "github.com/tabloy/keygate/internal/crypto"
 	"github.com/tabloy/keygate/internal/model"
 )
 
@@ -38,6 +41,72 @@ func (s *Store) CreateSigningKey(ctx context.Context, k *model.ReleaseSigningKey
 		return ErrSigningKeyAlreadyActive
 	}
 	return err
+}
+
+// RotateReleaseSigningKeyEncryption verifies and, when necessary,
+// re-encrypts every stored release-signing seed under the current master key.
+// Compare-and-swap updates make the procedure restart-safe.
+func (s *Store) RotateReleaseSigningKeyEncryption(ctx context.Context, current, previous *keycrypto.AESGCM) (int, error) {
+	if current == nil {
+		return 0, errors.New("current release signing encryption is not configured")
+	}
+	var keys []*model.ReleaseSigningKey
+	if err := s.DB.NewSelect().Model(&keys).OrderExpr("id ASC").Scan(ctx); err != nil {
+		return 0, err
+	}
+	rotated := 0
+	for _, key := range keys {
+		seed, err := current.Decrypt(key.PrivateKeyEncrypted, []byte(key.ProductID))
+		needsRotation := err != nil
+		if needsRotation {
+			if previous == nil {
+				return rotated, fmt.Errorf("release signing key %s cannot be decrypted with the current master key", key.ID)
+			}
+			seed, err = previous.Decrypt(key.PrivateKeyEncrypted, []byte(key.ProductID))
+			if err != nil {
+				return rotated, fmt.Errorf("release signing key %s cannot be decrypted with current or previous master key", key.ID)
+			}
+		}
+		if len(seed) != ed25519.SeedSize {
+			clear(seed)
+			return rotated, fmt.Errorf("release signing key %s has invalid seed length", key.ID)
+		}
+		priv := ed25519.NewKeyFromSeed(seed)
+		gotPublic := base64.StdEncoding.EncodeToString(priv.Public().(ed25519.PublicKey))
+		for i := range priv {
+			priv[i] = 0
+		}
+		if gotPublic != key.PublicKey {
+			for i := range seed {
+				seed[i] = 0
+			}
+			return rotated, fmt.Errorf("release signing key %s ciphertext does not match its public key", key.ID)
+		}
+		if !needsRotation {
+			for i := range seed {
+				seed[i] = 0
+			}
+			continue
+		}
+		fresh, err := current.Encrypt(seed, []byte(key.ProductID))
+		for i := range seed {
+			seed[i] = 0
+		}
+		if err != nil {
+			return rotated, err
+		}
+		res, err := s.DB.NewUpdate().Model((*model.ReleaseSigningKey)(nil)).
+			Set("private_key_encrypted = ?", fresh).
+			Where("id = ? AND private_key_encrypted = ?", key.ID, key.PrivateKeyEncrypted).
+			Exec(ctx)
+		if err != nil {
+			return rotated, err
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			rotated++
+		}
+	}
+	return rotated, nil
 }
 
 // FindActiveSigningKey returns the (single) active key for a product.

@@ -18,6 +18,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 	"github.com/stripe/stripe-go/v82"
 
 	"github.com/tabloy/keygate/internal/branding"
@@ -64,12 +65,27 @@ func main() {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	// Optional Redis-backed rate limiting
+	// Optional Redis-backed rate limiting. A configured backend is a hard
+	// dependency: startup verifies connectivity, and request-time errors fail
+	// closed instead of silently disabling abuse protection.
+	var rateLimitRedis *redis.Client
 	if cfg.RedisURL != "" {
-		logger.Info("Redis rate limiting enabled", "url", cfg.RedisURL)
-		// To enable: import github.com/redis/go-redis/v9 and uncomment:
-		// rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisURL})
-		// middleware.SetRateLimitBackend(middleware.NewRedisBackend(rdb))
+		redisOpts, err := redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			log.Fatalf("REDIS_URL: %v", err)
+		}
+		rateLimitRedis = redis.NewClient(redisOpts)
+		pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := rateLimitRedis.Ping(pingCtx).Err(); err != nil {
+			pingCancel()
+			log.Fatalf("Redis rate limiting startup check failed: %v", err)
+		}
+		pingCancel()
+		middleware.SetRateLimitBackend(middleware.NewRedisBackend(rateLimitRedis))
+		logger.Info("Redis rate limiting enabled")
+	}
+	if rateLimitRedis != nil {
+		defer rateLimitRedis.Close()
 	}
 
 	if cfg.StripeSecretKey != "" {
@@ -91,7 +107,10 @@ func main() {
 		30*time.Minute,
 		5*time.Minute,
 	)
-	webhookSvc := service.NewWebhookService(db, logger, webhookHTTPTimeout, cfg.WebhookMaxAttempts)
+	webhookSvc := service.NewWebhookServiceWithConfig(db, logger, service.WebhookHTTPConfig{
+		Timeout: webhookHTTPTimeout, MaxRetries: cfg.WebhookMaxAttempts,
+		RequireHTTPS: cfg.IsProduction(),
+	})
 	emailSvc := service.NewEmailService(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUsername, cfg.SMTPPassword, cfg.SMTPFrom, logger, db)
 	// LICENSE_SIGNING_KEY is a 32-byte ed25519 seed in hex. Parsed
 	// once here so an invalid value fails fast at startup rather
@@ -100,7 +119,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("LICENSE_SIGNING_KEY: %v", err)
 	}
-	licenseSvc := service.NewLicenseService(db, licenseSigningPriv, logger, bf, webhookSvc)
+	licenseSvc := service.NewLicenseServiceWithConfig(db, licenseSigningPriv, logger, bf, webhookSvc, service.LicenseTokenConfig{
+		KeyID:         cfg.LicenseSigningKeyID,
+		Issuer:        cfg.LicenseTokenIssuer,
+		PolicyVersion: cfg.LicenseTokenPolicyVersion,
+		TTL:           cfg.OfflineTokenTTL,
+		GracePeriod:   cfg.OfflineGracePeriod,
+	})
 	usageSvc := service.NewUsageService(db, webhookSvc, emailSvc, logger, cfg.QuotaWarningThreshold)
 	seatSvc := service.NewSeatService(db, webhookSvc, emailSvc, logger, cfg.BaseURL)
 	entitlementSvc := service.NewEntitlementService(db, logger)
@@ -154,29 +179,48 @@ func main() {
 	if cfg.IsMasterEncryptionKeyConfigured() {
 		masterRaw, err := hex.DecodeString(cfg.ReleaseKeyEncryptionKey)
 		if err != nil {
-			logger.Error("master key hex decode failed; license/release encryption disabled", "error", err)
+			log.Fatalf("master key hex decode failed: %v", err)
 		} else {
 			// Wire license-key encryption — orthogonal to storage.
 			db.LicenseKeyAEAD = crypto.MustDeriveAEAD(masterRaw, "license-key")
 			logger.Info("license key encryption: enabled")
-
-			// Best-effort backfill of unencrypted historical rows. Non-blocking,
-			// resumable across restarts. No timeout — runs until done or shutdown.
-			go func() {
-				n, err := db.BackfillLicenseKeyEncrypted(context.Background(), logger)
+			var previousLicenseAEAD *crypto.AESGCM
+			var previousReleaseAEAD *crypto.AESGCM
+			if cfg.ReleaseKeyEncryptionPreviousKey != "" {
+				previousRaw, err := hex.DecodeString(cfg.ReleaseKeyEncryptionPreviousKey)
 				if err != nil {
-					logger.Warn("license key backfill failed (will retry next start)",
-						"encrypted_so_far", n, "error", err)
-					return
+					log.Fatalf("previous master key hex decode failed: %v", err)
 				}
-				if n > 0 {
-					logger.Info("license key backfill complete", "encrypted", n)
-				}
-			}()
+				previousLicenseAEAD = crypto.MustDeriveAEAD(previousRaw, "license-key")
+				previousReleaseAEAD = crypto.MustDeriveAEAD(previousRaw, "release-signing-private-key")
+			}
+
+			finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			if rotated, err := db.RotateLicenseKeyEncryption(finalizeCtx, previousLicenseAEAD); err != nil {
+				finalizeCancel()
+				log.Fatalf("license key master-key verification/rotation: %v", err)
+			} else if rotated > 0 {
+				logger.Info("license key master-key rotation complete", "rotated", rotated)
+			}
+			if err := db.FinalizeLicenseKeyStorage(finalizeCtx, logger); err != nil {
+				finalizeCancel()
+				log.Fatalf("license key storage finalization: %v", err)
+			}
+			finalizeCancel()
+			logger.Info("license key storage: ciphertext-only")
+
+			releaseAEAD := crypto.MustDeriveAEAD(masterRaw, "release-signing-private-key")
+			rotationCtx, rotationCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			if rotated, err := db.RotateReleaseSigningKeyEncryption(rotationCtx, releaseAEAD, previousReleaseAEAD); err != nil {
+				rotationCancel()
+				log.Fatalf("release signing master-key verification/rotation: %v", err)
+			} else if rotated > 0 {
+				logger.Info("release signing master-key rotation complete", "rotated", rotated)
+			}
+			rotationCancel()
 
 			// Release signing requires storage in addition to the master key.
 			if cfg.IsStorageEnabled() {
-				releaseAEAD := crypto.MustDeriveAEAD(masterRaw, "release-signing-private-key")
 				releaseSigner = service.NewReleaseSigningService(service.ReleaseSigningServiceConfig{
 					Store:       db,
 					Storage:     releaseStorage,
@@ -188,7 +232,7 @@ func main() {
 			}
 		}
 	} else {
-		logger.Warn("license key encryption: DISABLED (RELEASE_KEY_ENCRYPTION_KEY not set)")
+		log.Fatalf("license key encryption is required")
 	}
 
 	releaseSvc := service.NewReleaseService(service.ReleaseServiceConfig{
@@ -204,12 +248,13 @@ func main() {
 	licenseH := handler.NewLicenseHandler(licenseSvc)
 	authH := &handler.AuthHandler{Store: db, Config: cfg, Email: emailSvc}
 	stripeH := &payment.StripeHandler{
-		Store:         db,
-		WebhookSecret: cfg.StripeWebhookSecret,
-		BaseURL:       cfg.BaseURL,
-		Email:         emailSvc,
-		WebhookSvc:    webhookSvc,
-		Livemode:      cfg.StripeLivemode,
+		Store:               db,
+		WebhookSecret:       cfg.StripeWebhookSecret,
+		BaseURL:             cfg.BaseURL,
+		Email:               emailSvc,
+		WebhookSvc:          webhookSvc,
+		Livemode:            cfg.StripeLivemode,
+		MaxWebhookBodyBytes: cfg.StripeWebhookMaxBytes,
 	}
 	// Initialize thread-safe webhook secret with config value
 	stripeH.SetWebhookSecret(cfg.StripeWebhookSecret)
@@ -334,14 +379,15 @@ func main() {
 
 	r.Use(middleware.RequestID())
 	r.Use(middleware.PrometheusMetrics())
+	r.Use(middleware.BodySizeLimit(cfg.MaxRequestBodyBytes))
 
 	// Security headers & attribution (AGPL v3 Section 7b — see NOTICE)
 	r.Use(func(c *gin.Context) {
 		c.Header(branding.HeaderKey, branding.Project)
 		c.Header("X-Frame-Options", "DENY")
 		c.Header("X-Content-Type-Options", "nosniff")
-		c.Header("X-XSS-Protection", "1; mode=block")
 		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
 		if strings.HasPrefix(cfg.BaseURL, "https://") {
 			c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
 		}
@@ -370,25 +416,19 @@ func main() {
 		c.Next()
 	})
 
-	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	operationalAuth := middleware.BearerTokenAuth(cfg.MetricsToken)
+	r.GET("/metrics", operationalAuth, gin.WrapH(promhttp.Handler()))
 
 	r.GET("/health", func(c *gin.Context) {
-		status := "ok"
-		checks := gin.H{}
-
-		// DB check
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "version": version.Version})
+	})
+	r.GET("/ready", operationalAuth, func(c *gin.Context) {
 		if err := db.DB.PingContext(c.Request.Context()); err != nil {
-			status = "degraded"
-			checks["database"] = "error: " + err.Error()
-		} else {
-			checks["database"] = "ok"
+			logger.Error("readiness dependency failed", "dependency", "database", "error", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not_ready"})
+			return
 		}
-
-		code := http.StatusOK
-		if status != "ok" {
-			code = http.StatusServiceUnavailable
-		}
-		c.JSON(code, gin.H{"status": status, "checks": checks, "version": version.Version})
+		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
 
 	// API documentation (public, read-only)
@@ -409,7 +449,9 @@ func main() {
 
 	v1.GET("/version", systemH.GetVersion)
 
-	setupH := handler.NewSetupHandler(db)
+	setupH := handler.NewSetupHandler(db, handler.SetupOptions{
+		Enabled: cfg.SetupEnabled, BootstrapSecret: cfg.BootstrapSecret,
+	})
 	v1.GET("/setup/status", setupH.Status)
 	v1.POST("/setup/initialize", setupH.Initialize)
 
@@ -435,8 +477,28 @@ func main() {
 		c.Header("Cache-Control", "public, max-age=3600")
 		response.OK(c, gin.H{
 			"algorithm":  "ed25519",
+			"kid":        licenseSvc.SigningKeyID(),
 			"public_key": licensePubHex,
 			"format":     "hex",
+		})
+	})
+	v1.GET("/license/keys", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=3600")
+		keys := []gin.H{{
+			"kid": licenseSvc.SigningKeyID(), "algorithm": "ed25519",
+			"public_key": licensePubHex, "status": "current",
+		}}
+		if cfg.LicensePreviousPublicKey != "" && time.Now().Before(cfg.LicensePreviousKeyValidUntil) {
+			keys = append(keys, gin.H{
+				"kid": cfg.LicensePreviousKeyID, "algorithm": "ed25519",
+				"public_key": cfg.LicensePreviousPublicKey, "status": "previous",
+				"valid_until": cfg.LicensePreviousKeyValidUntil.UTC().Format(time.RFC3339),
+			})
+		}
+		response.OK(c, gin.H{
+			"issuer":         cfg.LicenseTokenIssuer,
+			"policy_version": cfg.LicenseTokenPolicyVersion,
+			"keys":           keys,
 		})
 	})
 
@@ -566,6 +628,13 @@ func main() {
 			if err != nil {
 				response.Internal(c)
 				return
+			}
+			for _, lic := range licenses {
+				lic.LicenseKey = db.DecryptLicenseKey(lic)
+				if lic.LicenseKey == "" {
+					response.Internal(c)
+					return
+				}
 			}
 			response.OK(c, gin.H{"licenses": licenses})
 		})
@@ -838,6 +907,7 @@ func main() {
 
 		// ─── License CRUD + lifecycle: also reachable by licenses:write keys ───
 		licWrite.GET("/licenses", adminH.ListLicenses)
+		licWrite.POST("/usage", middleware.Idempotency(db), usageH.RecordBillableUsage)
 		licWrite.GET("/licenses/export", adminH.ExportLicenses)
 		licWrite.GET("/licenses/:id", adminH.GetLicense)
 		licWrite.POST("/licenses", adminH.CreateLicense)
@@ -935,8 +1005,13 @@ func main() {
 	serveFrontend(r)
 
 	srv := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: r,
+		Addr:              ":" + cfg.Port,
+		Handler:           r,
+		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
+		ReadTimeout:       cfg.HTTPReadTimeout,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
+		IdleTimeout:       cfg.HTTPIdleTimeout,
+		MaxHeaderBytes:    cfg.HTTPMaxHeaderBytes,
 	}
 
 	go func() {

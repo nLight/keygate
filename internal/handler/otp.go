@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"log/slog"
 	"math/big"
 	"strings"
 	"time"
@@ -27,39 +26,61 @@ func (h *AuthHandler) OTPSend(c *gin.Context) {
 		return
 	}
 	email := strings.ToLower(strings.TrimSpace(req.Email))
-
-	// Rate limit: max 3 OTP requests per email per 10 minutes
-	count, err := h.Store.CountRecentOTPCodes(c, email)
-	if err != nil {
-		response.Internal(c)
+	respondSent := func() { response.OK(c, gin.H{"status": "sent"}) }
+	if h.Config == nil || !h.Config.OTPEnabled || h.Email == nil || !h.Email.IsConfigured() {
+		// Indistinguishable from a real delivery. Production validation
+		// prevents this configuration; the closed response avoids account
+		// enumeration during maintenance or partial outages.
+		respondSent()
 		return
 	}
-	if count >= 3 {
-		response.Err(c, 429, "RATE_LIMITED", "too many code requests, try again later")
-		return
+
+	if !h.Config.OTPOpenRegistration {
+		allowed, err := h.Store.IsOTPRecipientKnown(c, email)
+		if err != nil {
+			response.Internal(c)
+			return
+		}
+		if !allowed {
+			parts := strings.Split(email, "@")
+			domain := ""
+			if len(parts) == 2 {
+				domain = parts[1]
+			}
+			for _, approved := range h.Config.OTPAllowedDomains {
+				if strings.EqualFold(domain, approved) {
+					allowed = true
+					break
+				}
+			}
+		}
+		if !allowed {
+			respondSent()
+			return
+		}
 	}
 
 	code := generateOTPCode()
-	codeHash := hashOTPCode(code)
+	codeHash := hashOTPCode(code, h.Config.OTPPepper)
 
 	otp := &model.OTPCode{
 		Email:     email,
 		CodeHash:  codeHash,
 		ExpiresAt: time.Now().Add(10 * time.Minute),
 	}
-	if err := h.Store.CreateOTPCode(c, otp); err != nil {
+	created, err := h.Store.CreateOTPCodeWithLimit(c, otp, 3)
+	if err != nil {
 		response.Internal(c)
 		return
 	}
-
-	if h.Email != nil && h.Email.IsConfigured() {
-		h.Email.SendOTPCode(email, code)
-	} else {
-		slog.Warn("SMTP not configured — OTP code printed to log (configure SMTP for email delivery)",
-			"email", email, "code", code)
+	if !created {
+		respondSent()
+		return
 	}
 
-	response.OK(c, gin.H{"status": "sent"})
+	h.Email.SendOTPCode(email, code)
+
+	respondSent()
 }
 
 // OTPVerify handles POST /api/v1/auth/otp/verify
@@ -74,39 +95,21 @@ func (h *AuthHandler) OTPVerify(c *gin.Context) {
 	}
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 	code := strings.TrimSpace(req.Code)
-
-	otp, err := h.Store.FindLatestValidOTPCode(c, email)
-
-	// Always perform hash comparison to prevent timing-based email enumeration
-	expectedHash := hashOTPCode("") // dummy
-	otpID := ""
-	otpAttempts := 0
-	if err == nil && otp != nil {
-		expectedHash = otp.CodeHash
-		otpID = otp.ID
-		otpAttempts = otp.Attempts
-	}
-
-	codeMatch := hmac.Equal([]byte(hashOTPCode(code)), []byte(expectedHash))
-
-	if otpID != "" {
-		if err := h.Store.IncrementOTPAttempts(c, otpID); err != nil {
-			slog.Warn("failed to increment OTP attempts", "id", otpID, "error", err)
-		}
-	}
-
-	if !codeMatch || otp == nil {
-		remaining := 5 - (otpAttempts + 1)
-		if remaining <= 0 {
-			response.Unauthorized(c, "too many attempts, request a new code")
-		} else {
-			response.Unauthorized(c, "invalid or expired code")
-		}
+	if h.Config == nil || !h.Config.OTPEnabled {
+		response.Unauthorized(c, "invalid or expired code")
 		return
 	}
 
-	if err := h.Store.MarkOTPUsed(c, otpID); err != nil {
-		slog.Warn("failed to mark OTP used", "id", otpID, "error", err)
+	candidateVerifier := hashOTPCode(code, h.Config.OTPPepper)
+	dummyVerifier := hashOTPCode("", h.Config.OTPPepper)
+	otp, codeMatch, err := h.Store.ConsumeOTPCode(c, email, candidateVerifier, dummyVerifier)
+	if err != nil {
+		response.Internal(c)
+		return
+	}
+	if !codeMatch || otp == nil {
+		response.Unauthorized(c, "invalid or expired code")
+		return
 	}
 
 	// Upsert user (create on first login)
@@ -151,7 +154,8 @@ func generateOTPCode() string {
 	return fmt.Sprintf("%06d", n.Int64())
 }
 
-func hashOTPCode(code string) string {
-	h := sha256.Sum256([]byte(code))
-	return hex.EncodeToString(h[:])
+func hashOTPCode(code, pepper string) string {
+	h := hmac.New(sha256.New, []byte(pepper))
+	_, _ = h.Write([]byte(code))
+	return hex.EncodeToString(h.Sum(nil))
 }

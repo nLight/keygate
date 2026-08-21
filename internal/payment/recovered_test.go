@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	keycrypto "github.com/tabloy/keygate/internal/crypto"
 	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/store"
 )
@@ -34,6 +35,7 @@ func TestNotifyPaymentRecovered_EpisodeScopedDedup(t *testing.T) {
 	if err := s.RunMigrations("../../db/migrations"); err != nil {
 		t.Fatalf("migrations: %v", err)
 	}
+	s.LicenseKeyAEAD = keycrypto.MustDeriveAEAD(make([]byte, 32), "license-key")
 	ctx := context.Background()
 
 	suffix := time.Now().Format("150405.000")
@@ -121,6 +123,7 @@ func TestNotifyPaymentRecovered_LegacyZeroEpisode(t *testing.T) {
 	if err := s.RunMigrations("../../db/migrations"); err != nil {
 		t.Fatalf("migrations: %v", err)
 	}
+	s.LicenseKeyAEAD = keycrypto.MustDeriveAEAD(make([]byte, 32), "license-key")
 	ctx := context.Background()
 
 	suffix := time.Now().Format("150405.000") + "-legacy"

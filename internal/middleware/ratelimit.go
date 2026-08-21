@@ -1,6 +1,8 @@
 // Rate limiting middleware with pluggable backends.
 // Supports in-memory (single instance) and Redis (multi-instance) backends.
-// Set REDIS_URL to enable Redis backend; falls back to in-memory if not set.
+// Set REDIS_URL to enable Redis backend. Redis errors fail closed so an
+// authentication or license-verification path never silently becomes
+// unlimited during an outage.
 package middleware
 
 import (
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 )
 
 // RateLimitBackend abstracts the rate limiting storage.
@@ -73,12 +76,7 @@ func (mb *memoryBackend) cleanup() {
 // RedisClient is a minimal interface for Redis operations needed by rate limiting.
 // Compatible with github.com/redis/go-redis/v9.
 type RedisClient interface {
-	Eval(ctx context.Context, script string, keys []string, args ...interface{}) RedisResult
-}
-
-// RedisResult is the minimal result interface.
-type RedisResult interface {
-	Int64() (int64, error)
+	Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd
 }
 
 type redisBackend struct {
@@ -112,7 +110,8 @@ func (rb *redisBackend) Allow(key string, rate int, window time.Duration) bool {
 	)
 	count, err := result.Int64()
 	if err != nil {
-		return true // fail open on Redis errors
+		RateLimitBackendErrors.Inc()
+		return false
 	}
 	return count <= int64(rate)
 }
@@ -139,6 +138,7 @@ func RateLimit(rate int, window time.Duration) gin.HandlerFunc {
 		}
 
 		if !defaultBackend.Allow(key, rate, window) {
+			RateLimitRejections.Inc()
 			abortWithError(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
 			return
 		}
@@ -150,6 +150,7 @@ func RateLimit(rate int, window time.Duration) gin.HandlerFunc {
 func RateLimitByIP(rate int, window time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !defaultBackend.Allow("ip:"+c.ClientIP(), rate, window) {
+			RateLimitRejections.Inc()
 			abortWithError(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
 			return
 		}

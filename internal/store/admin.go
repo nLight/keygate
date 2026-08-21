@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -283,17 +284,35 @@ func (s *Store) ReinstateLicense(ctx context.Context, id string) error {
 	return nil
 }
 
+var ErrProductScopeMismatch = errors.New("requested product is outside the caller scope")
+
+// LicenseExportFilter carries both the user-supplied filter and the caller's
+// immutable authorization scope. Keeping both in the store contract prevents a
+// future handler from accidentally turning an omitted product_id into a global
+// export for a product-bound API key.
+type LicenseExportFilter struct {
+	ProductID      string
+	ScopeProductID string
+	Status         string
+}
+
 // ExportLicenses returns all licenses matching filters (no pagination).
-func (s *Store) ExportLicenses(ctx context.Context, productID, status string) ([]*model.License, error) {
+func (s *Store) ExportLicenses(ctx context.Context, f LicenseExportFilter) ([]*model.License, error) {
+	if f.ScopeProductID != "" {
+		if f.ProductID != "" && f.ProductID != f.ScopeProductID {
+			return nil, ErrProductScopeMismatch
+		}
+		f.ProductID = f.ScopeProductID
+	}
 	var out []*model.License
 	q := s.DB.NewSelect().Model(&out).
 		Relation("Plan").Relation("Product").
 		OrderExpr("license.created_at DESC")
-	if productID != "" {
-		q = q.Where("license.product_id = ?", productID)
+	if f.ProductID != "" {
+		q = q.Where("license.product_id = ?", f.ProductID)
 	}
-	if status != "" {
-		q = q.Where("license.status = ?", status)
+	if f.Status != "" {
+		q = q.Where("license.status = ?", f.Status)
 	}
 	err := q.Scan(ctx)
 	return out, err

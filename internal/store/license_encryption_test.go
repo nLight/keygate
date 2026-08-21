@@ -52,7 +52,7 @@ func TestDecryptLicenseKey_RoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Simulate a row read where plaintext column has been wiped (Phase C state).
+	// Simulate a row read after the legacy plaintext column has been wiped.
 	plainSaved := l.LicenseKey
 	l.LicenseKey = ""
 
@@ -62,15 +62,13 @@ func TestDecryptLicenseKey_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestDecryptLicenseKey_FallbackToPlaintext(t *testing.T) {
-	// AEAD configured but the row was inserted before encryption was enabled.
+func TestDecryptLicenseKey_MissingCiphertextFailsClosed(t *testing.T) {
 	s := makeStoreWithAEAD(t)
 	l := &model.License{ID: "lic_legacy", LicenseKey: "KGT-OLD-ROW"}
-	// LicenseKeyEncrypted intentionally empty.
 
 	got := s.DecryptLicenseKey(l)
-	if got != "KGT-OLD-ROW" {
-		t.Errorf("expected fallback to plaintext column: got %q", got)
+	if got != "" {
+		t.Errorf("missing ciphertext must fail closed: got %q", got)
 	}
 }
 
@@ -80,8 +78,8 @@ func TestDecryptLicenseKey_NoAEAD(t *testing.T) {
 	l := &model.License{ID: "lic_x", LicenseKey: "KGT-FOO"}
 
 	got := s.DecryptLicenseKey(l)
-	if got != "KGT-FOO" {
-		t.Errorf("expected plaintext when AEAD nil: got %q", got)
+	if got != "" {
+		t.Errorf("missing AEAD must fail closed: got %q", got)
 	}
 }
 
@@ -103,9 +101,8 @@ func TestDecryptLicenseKey_AADBindingPreventsCrossRowReplay(t *testing.T) {
 		LicenseKeyEncrypted: l1.LicenseKeyEncrypted,
 	}
 	got := s.DecryptLicenseKey(swapped)
-	// Decrypt fails with wrong AAD; we fall back to (empty) plaintext column.
-	// Either empty or the original l1 key would be wrong — but the contract
-	// says fall back to plaintext on decrypt failure, so we expect "".
+	// Decrypt fails with wrong AAD and there is deliberately no plaintext
+	// fallback, so the fail-closed result is empty.
 	if got == "KGT-AAAA" {
 		t.Errorf("AAD binding broken: cross-row decrypt succeeded")
 	}
@@ -121,18 +118,12 @@ func TestDecryptLicenseKey_NilLicense(t *testing.T) {
 	}
 }
 
-func TestPrepareLicenseForInsert_NoAEAD_DoesNotEncrypt(t *testing.T) {
+func TestPrepareLicenseForInsert_NoAEADFailsClosed(t *testing.T) {
 	s := &Store{} // no AEAD
 	l := &model.License{LicenseKey: "KGT-NOENC"}
 
-	if err := s.prepareLicenseForInsert(l); err != nil {
-		t.Fatal(err)
-	}
-	if len(l.LicenseKeyEncrypted) != 0 {
-		t.Error("LicenseKeyEncrypted must stay empty when AEAD is nil")
-	}
-	if l.KeyHash == "" {
-		t.Error("KeyHash should still be set even without AEAD")
+	if err := s.prepareLicenseForInsert(l); err == nil {
+		t.Fatal("expected missing AEAD to reject the insert")
 	}
 }
 

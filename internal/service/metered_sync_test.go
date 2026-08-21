@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	keycrypto "github.com/tabloy/keygate/internal/crypto"
 	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/store"
 )
@@ -50,6 +51,7 @@ func setupMeteredTest(t *testing.T) (*meteredTestSetup, context.Context) {
 	if err := s.RunMigrations("../../db/migrations"); err != nil {
 		t.Fatalf("migrations: %v", err)
 	}
+	s.LicenseKeyAEAD = keycrypto.MustDeriveAEAD(make([]byte, 32), "license-key")
 	t.Cleanup(func() { _ = s.Close() })
 
 	setup := &meteredTestSetup{store: s}

@@ -1,7 +1,9 @@
 package config
 
 import (
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestIsDevLoginAllowed(t *testing.T) {
@@ -71,7 +73,17 @@ func TestValidateSecurityDefaults(t *testing.T) {
 			Environment: "development",
 			JWTSecret:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			// 32-byte ed25519 seed in hex (64 chars).
-			LicenseSigningKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			LicenseSigningKey:         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			LicenseTokenPolicyVersion: 1,
+			OfflineTokenTTL:           time.Hour,
+			MaxRequestBodyBytes:       1024,
+			StripeWebhookMaxBytes:     512,
+			HTTPReadHeaderTimeout:     time.Second,
+			HTTPReadTimeout:           time.Second,
+			HTTPWriteTimeout:          time.Second,
+			HTTPIdleTimeout:           time.Second,
+			HTTPMaxHeaderBytes:        1024,
+			ReleaseKeyEncryptionKey:   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		}
 		warnings, fatal := c.ValidateSecurityDefaults()
 		if len(fatal) > 0 {
@@ -131,6 +143,33 @@ func TestValidateSecurityDefaults(t *testing.T) {
 		}
 		if !found {
 			t.Error("expected admin emails warning in production")
+		}
+	})
+
+	t.Run("production requires HTTPS and Redis", func(t *testing.T) {
+		c := &Config{
+			Environment:               "production",
+			BaseURL:                   "http://keygate.example",
+			JWTSecret:                 strings.Repeat("j", 32),
+			LicenseSigningKey:         strings.Repeat("01", 32),
+			LicenseTokenPolicyVersion: 1,
+			OfflineTokenTTL:           time.Hour,
+			MaxRequestBodyBytes:       1024,
+			StripeWebhookMaxBytes:     512,
+			HTTPReadHeaderTimeout:     time.Second,
+			HTTPReadTimeout:           time.Second,
+			HTTPWriteTimeout:          time.Second,
+			HTTPIdleTimeout:           time.Second,
+			HTTPMaxHeaderBytes:        1024,
+			ReleaseKeyEncryptionKey:   strings.Repeat("02", 32),
+			MetricsToken:              strings.Repeat("m", 32),
+			OTPPepper:                 strings.Repeat("o", 32),
+			SetupEnabled:              false,
+		}
+		_, fatal := c.ValidateSecurityDefaults()
+		joined := strings.Join(fatal, "\n")
+		if !strings.Contains(joined, "BASE_URL") || !strings.Contains(joined, "REDIS_URL") {
+			t.Fatalf("expected production transport/backend failures, got: %v", fatal)
 		}
 	})
 }

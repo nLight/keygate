@@ -11,7 +11,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/tabloy/keygate/internal/middleware"
@@ -20,21 +23,118 @@ import (
 )
 
 type WebhookService struct {
-	store      *store.Store
-	logger     *slog.Logger
-	client     *http.Client
-	maxRetries int
-	sem        chan struct{} // concurrency limiter
+	store        *store.Store
+	logger       *slog.Logger
+	client       *http.Client
+	maxRetries   int
+	sem          chan struct{} // concurrency limiter
+	requireHTTPS bool
 }
 
 func NewWebhookService(s *store.Store, logger *slog.Logger, httpTimeout time.Duration, maxRetries int) *WebhookService {
-	return &WebhookService{
-		store:      s,
-		logger:     logger,
-		client:     &http.Client{Timeout: httpTimeout},
-		maxRetries: maxRetries,
-		sem:        make(chan struct{}, 20), // max 20 concurrent deliveries
+	return NewWebhookServiceWithConfig(s, logger, WebhookHTTPConfig{
+		Timeout: httpTimeout, MaxRetries: maxRetries,
+	})
+}
+
+type WebhookHTTPConfig struct {
+	Timeout      time.Duration
+	MaxRetries   int
+	RequireHTTPS bool
+}
+
+func NewWebhookServiceWithConfig(s *store.Store, logger *slog.Logger, cfg WebhookHTTPConfig) *WebhookService {
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 10 * time.Second
 	}
+	transport := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           safeWebhookDialer,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		MaxIdleConns:          20,
+		IdleConnTimeout:       30 * time.Second,
+	}
+	svc := &WebhookService{
+		store:        s,
+		logger:       logger,
+		maxRetries:   cfg.MaxRetries,
+		sem:          make(chan struct{}, 20),
+		requireHTTPS: cfg.RequireHTTPS,
+	}
+	svc.client = &http.Client{
+		Timeout:   cfg.Timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("webhook redirect limit exceeded")
+			}
+			return svc.ValidateDestinationURL(req.Context(), req.URL.String())
+		},
+	}
+	return svc
+}
+
+func isForbiddenWebhookIP(ip net.IP) bool {
+	if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	// Carrier-grade NAT is not classified private by net.IP.IsPrivate, but it
+	// is still an internal destination and must not receive tenant webhooks.
+	_, cgnat, _ := net.ParseCIDR("100.64.0.0/10")
+	return cgnat.Contains(ip)
+}
+
+func safeWebhookDialer(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve webhook host: %w", err)
+	}
+	dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	for _, addr := range addrs {
+		if isForbiddenWebhookIP(addr.IP) {
+			continue
+		}
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(addr.IP.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+	}
+	return nil, fmt.Errorf("webhook destination resolves only to blocked or unreachable addresses")
+}
+
+// ValidateDestinationURL is applied when a webhook is saved, before every
+// request, after each redirect, and again at dial time.
+func (s *WebhookService) ValidateDestinationURL(ctx context.Context, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" || u.User != nil {
+		return fmt.Errorf("invalid webhook URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("webhook URL must use HTTP or HTTPS")
+	}
+	if s.requireHTTPS && u.Scheme != "https" {
+		return fmt.Errorf("webhook URL must use HTTPS")
+	}
+	if strings.EqualFold(u.Hostname(), "localhost") {
+		return fmt.Errorf("webhook destination is not public")
+	}
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, u.Hostname())
+	if err != nil || len(addrs) == 0 {
+		return fmt.Errorf("webhook host cannot be resolved")
+	}
+	for _, addr := range addrs {
+		if isForbiddenWebhookIP(addr.IP) {
+			return fmt.Errorf("webhook destination is not public")
+		}
+	}
+	return nil
 }
 
 func (s *WebhookService) Dispatch(ctx context.Context, productID, event string, data map[string]any) {
@@ -82,6 +182,10 @@ func (s *WebhookService) DispatchWithLog(ctx context.Context, productID, event s
 
 func (s *WebhookService) deliver(wh *model.Webhook, delivery *model.WebhookDelivery) {
 	ctx := context.Background()
+	if err := s.ValidateDestinationURL(ctx, wh.URL); err != nil {
+		s.failDelivery(ctx, delivery, 0, err.Error())
+		return
+	}
 	body, _ := json.Marshal(delivery.Payload)
 	sig := signPayload(body, wh.Secret)
 

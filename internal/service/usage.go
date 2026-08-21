@@ -23,12 +23,13 @@ func NewUsageService(s *store.Store, wh *WebhookService, em *EmailService, logge
 }
 
 type RecordUsageInput struct {
-	LicenseKey string
-	Feature    string
-	Quantity   int64
-	Metadata   map[string]any
-	ProductID  string
-	IPAddress  string
+	LicenseKey     string
+	Feature        string
+	Quantity       int64
+	Metadata       map[string]any
+	ProductID      string
+	IPAddress      string
+	TrustedBilling bool
 }
 
 type RecordUsageResult struct {
@@ -115,7 +116,7 @@ func (s *UsageService) RecordUsage(ctx context.Context, in RecordUsageInput) (*R
 	// Best-effort: a failure here doesn't roll back the in-Keygate
 	// accounting (we'd rather over-grant than under-bill on a
 	// transient blip; the next RecordUsage isn't affected).
-	if quota.StripeMeterEventName != "" {
+	if quota.StripeMeterEventName != "" && in.TrustedBilling {
 		if err := s.store.InsertMeteredEvent(ctx, lic.ID, in.Feature, periodKey, in.Quantity); err != nil {
 			s.logger.Error("metered enqueue failed", "license_id", lic.ID, "feature", in.Feature, "error", err)
 		}

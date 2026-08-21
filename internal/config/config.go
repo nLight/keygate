@@ -3,9 +3,11 @@ package config
 import (
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -17,8 +19,28 @@ type Config struct {
 
 	DatabaseURL string
 
-	JWTSecret         string
-	LicenseSigningKey string
+	JWTSecret                    string
+	LicenseSigningKey            string
+	LicenseSigningKeyID          string
+	LicensePreviousPublicKey     string
+	LicensePreviousKeyID         string
+	LicensePreviousKeyValidUntil time.Time
+	LicenseTokenIssuer           string
+	LicenseTokenPolicyVersion    int
+	OfflineTokenTTL              time.Duration
+	OfflineGracePeriod           time.Duration
+	OfflineClockSkew             time.Duration
+
+	// First-run setup is disabled after an owner has been provisioned. When it
+	// is enabled, BootstrapSecret is a one-time, out-of-band credential and is
+	// never returned by the API.
+	SetupEnabled    bool
+	BootstrapSecret string
+
+	OTPEnabled          bool
+	OTPPepper           string
+	OTPOpenRegistration bool
+	OTPAllowedDomains   []string
 
 	StripeSecretKey     string
 	StripeWebhookSecret string
@@ -40,7 +62,16 @@ type Config struct {
 	SMTPPassword string
 	SMTPFrom     string
 
-	RedisURL string
+	RedisURL     string
+	MetricsToken string
+
+	MaxRequestBodyBytes   int64
+	StripeWebhookMaxBytes int64
+	HTTPReadHeaderTimeout time.Duration
+	HTTPReadTimeout       time.Duration
+	HTTPWriteTimeout      time.Duration
+	HTTPIdleTimeout       time.Duration
+	HTTPMaxHeaderBytes    int
 
 	RateLimitAPI   int
 	RateLimitAdmin int
@@ -76,12 +107,14 @@ type Config struct {
 	//
 	// Operational notes:
 	//   - Generate via: openssl rand -hex 32
-	//   - Rotation requires re-encrypting all release_signing_keys rows.
-	//     There is no automatic migration on key change — the operator must
-	//     run a re-encryption script, otherwise existing keys become
-	//     undecryptable and signing fails.
+	//   - Rotation requires supplying the former value through
+	//     RELEASE_KEY_ENCRYPTION_PREVIOUS_KEY for one successful startup.
+	//     Startup verifies and restart-safely re-encrypts existing rows.
 	//   - Losing this key permanently locks all signed releases.
 	ReleaseKeyEncryptionKey string
+	// ReleaseKeyEncryptionPreviousKey is accepted only during a controlled,
+	// restart-safe rotation. Remove it after every row has been re-encrypted.
+	ReleaseKeyEncryptionPreviousKey string
 
 	// MaxReleaseSignSize caps the largest artifact we will sign server-side.
 	// Pure Ed25519 requires the full message in memory; 500 MB is a
@@ -100,17 +133,69 @@ func Load() (*Config, error) {
 
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 
-		JWTSecret:         os.Getenv("JWT_SECRET"),
-		LicenseSigningKey: os.Getenv("LICENSE_SIGNING_KEY"),
+		JWTSecret:                 os.Getenv("JWT_SECRET"),
+		LicenseSigningKey:         os.Getenv("LICENSE_SIGNING_KEY"),
+		LicenseSigningKeyID:       os.Getenv("LICENSE_SIGNING_KEY_ID"),
+		LicensePreviousPublicKey:  os.Getenv("LICENSE_PREVIOUS_PUBLIC_KEY"),
+		LicensePreviousKeyID:      os.Getenv("LICENSE_PREVIOUS_KEY_ID"),
+		LicenseTokenPolicyVersion: envIntOr("LICENSE_TOKEN_POLICY_VERSION", 1),
+		SetupEnabled:              envBoolOr("SETUP_ENABLED", true),
+		BootstrapSecret:           os.Getenv("BOOTSTRAP_SECRET"),
+		OTPEnabled:                envBoolOr("OTP_ENABLED", true),
+		OTPPepper:                 os.Getenv("OTP_PEPPER"),
 
 		StripeSecretKey:     os.Getenv("STRIPE_SECRET_KEY"),
 		StripeWebhookSecret: os.Getenv("STRIPE_WEBHOOK_SECRET"),
 	}
+	cfg.LicenseTokenIssuer = envOr("LICENSE_TOKEN_ISSUER", cfg.BaseURL)
+	cfg.OTPOpenRegistration = envBoolOr("OTP_OPEN_REGISTRATION", !cfg.IsProduction())
+	if domains := os.Getenv("OTP_ALLOWED_DOMAINS"); domains != "" {
+		for _, domain := range strings.Split(domains, ",") {
+			domain = strings.ToLower(strings.TrimSpace(domain))
+			if domain != "" {
+				cfg.OTPAllowedDomains = append(cfg.OTPAllowedDomains, domain)
+			}
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("LICENSE_PREVIOUS_KEY_VALID_UNTIL")); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return nil, fmt.Errorf("LICENSE_PREVIOUS_KEY_VALID_UNTIL must be RFC3339: %w", err)
+		}
+		cfg.LicensePreviousKeyValidUntil = parsed
+	}
+
+	var err error
+	if cfg.OfflineTokenTTL, err = envDurationOr("OFFLINE_TOKEN_TTL", "24h"); err != nil {
+		return nil, err
+	}
+	if cfg.OfflineGracePeriod, err = envDurationOr("OFFLINE_GRACE_PERIOD", "0s"); err != nil {
+		return nil, err
+	}
+	if cfg.OfflineClockSkew, err = envDurationOr("OFFLINE_CLOCK_SKEW", "2m"); err != nil {
+		return nil, err
+	}
+	if cfg.HTTPReadHeaderTimeout, err = envDurationOr("HTTP_READ_HEADER_TIMEOUT", "5s"); err != nil {
+		return nil, err
+	}
+	if cfg.HTTPReadTimeout, err = envDurationOr("HTTP_READ_TIMEOUT", "15s"); err != nil {
+		return nil, err
+	}
+	if cfg.HTTPWriteTimeout, err = envDurationOr("HTTP_WRITE_TIMEOUT", "30s"); err != nil {
+		return nil, err
+	}
+	if cfg.HTTPIdleTimeout, err = envDurationOr("HTTP_IDLE_TIMEOUT", "60s"); err != nil {
+		return nil, err
+	}
+	cfg.MaxRequestBodyBytes = int64(envIntOr("MAX_REQUEST_BODY_KB", 1024)) * 1024
+	cfg.StripeWebhookMaxBytes = int64(envIntOr("STRIPE_WEBHOOK_MAX_KB", 256)) * 1024
+	cfg.HTTPMaxHeaderBytes = envIntOr("HTTP_MAX_HEADER_KB", 32) * 1024
 
 	envVal, envSet := os.LookupEnv("STRIPE_LIVEMODE")
 	cfg.StripeLivemode = deriveLivemode(envVal, envSet, cfg.StripeSecretKey)
 
 	cfg.RedisURL = os.Getenv("REDIS_URL")
+	cfg.MetricsToken = os.Getenv("METRICS_TOKEN")
 
 	cfg.SMTPHost = os.Getenv("SMTP_HOST")
 	cfg.SMTPPort = envOr("SMTP_PORT", "587")
@@ -145,6 +230,7 @@ func Load() (*Config, error) {
 	cfg.StorageUploadTTL = envOr("STORAGE_UPLOAD_TTL", "1h")
 	cfg.StorageDownloadTTL = envOr("STORAGE_DOWNLOAD_TTL", "10m")
 	cfg.ReleaseKeyEncryptionKey = os.Getenv("RELEASE_KEY_ENCRYPTION_KEY")
+	cfg.ReleaseKeyEncryptionPreviousKey = os.Getenv("RELEASE_KEY_ENCRYPTION_PREVIOUS_KEY")
 	cfg.MaxReleaseSignSize = int64(envIntOr("MAX_RELEASE_SIGN_SIZE_MB", 500)) * 1024 * 1024
 
 	if cfg.DatabaseURL == "" {
@@ -250,9 +336,58 @@ func (c *Config) ValidateSecurityDefaults() (warnings []string, fatal []string) 
 	}
 
 	if c.IsProduction() {
+		baseURL, err := url.Parse(c.BaseURL)
+		if err != nil || baseURL.Scheme != "https" || baseURL.Host == "" {
+			fatal = append(fatal, "BASE_URL must be an absolute https URL in production")
+		}
+		if strings.TrimSpace(c.RedisURL) == "" {
+			fatal = append(fatal, "REDIS_URL is required in production for distributed abuse protection")
+		}
 		// Must have at least one admin
 		if len(c.AdminEmails) == 0 {
 			warnings = append(warnings, "SECURITY: ADMIN_EMAILS is empty — no one can access the admin panel")
+		}
+		if len(c.MetricsToken) < 32 {
+			fatal = append(fatal, "METRICS_TOKEN must contain at least 32 characters in production")
+		}
+		if c.OTPEnabled && (c.SMTPHost == "" || c.SMTPFrom == "") {
+			fatal = append(fatal, "SMTP_HOST and SMTP_FROM are required when OTP_ENABLED=true in production")
+		}
+	}
+	if c.ReleaseKeyEncryptionPreviousKey != "" {
+		if len(c.ReleaseKeyEncryptionPreviousKey) != 64 {
+			fatal = append(fatal, "RELEASE_KEY_ENCRYPTION_PREVIOUS_KEY must be exactly 64 hex chars")
+		} else if _, err := hex.DecodeString(c.ReleaseKeyEncryptionPreviousKey); err != nil {
+			fatal = append(fatal, "RELEASE_KEY_ENCRYPTION_PREVIOUS_KEY is not valid hex: "+err.Error())
+		} else if c.ReleaseKeyEncryptionPreviousKey == c.ReleaseKeyEncryptionKey {
+			fatal = append(fatal, "RELEASE_KEY_ENCRYPTION_PREVIOUS_KEY must differ from the current master key")
+		}
+	}
+	if c.SetupEnabled && len(c.BootstrapSecret) < 32 {
+		fatal = append(fatal, "BOOTSTRAP_SECRET must contain at least 32 characters while SETUP_ENABLED=true")
+	}
+	if c.OTPEnabled && len(c.OTPPepper) < 32 {
+		fatal = append(fatal, "OTP_PEPPER must contain at least 32 characters when OTP_ENABLED=true")
+	}
+	if c.OfflineTokenTTL <= 0 {
+		fatal = append(fatal, "OFFLINE_TOKEN_TTL must be positive")
+	}
+	if c.OfflineGracePeriod < 0 || c.OfflineClockSkew < 0 {
+		fatal = append(fatal, "OFFLINE_GRACE_PERIOD and OFFLINE_CLOCK_SKEW cannot be negative")
+	}
+	if c.LicenseTokenPolicyVersion <= 0 {
+		fatal = append(fatal, "LICENSE_TOKEN_POLICY_VERSION must be positive")
+	}
+	if c.MaxRequestBodyBytes <= 0 || c.StripeWebhookMaxBytes <= 0 || c.StripeWebhookMaxBytes > c.MaxRequestBodyBytes {
+		fatal = append(fatal, "request body limits must be positive and STRIPE_WEBHOOK_MAX_KB must not exceed MAX_REQUEST_BODY_KB")
+	}
+	if c.HTTPReadHeaderTimeout <= 0 || c.HTTPReadTimeout <= 0 || c.HTTPWriteTimeout <= 0 || c.HTTPIdleTimeout <= 0 || c.HTTPMaxHeaderBytes <= 0 {
+		fatal = append(fatal, "HTTP server timeouts and header limit must be positive")
+	}
+	if c.LicensePreviousPublicKey != "" {
+		pub, err := hex.DecodeString(strings.TrimSpace(c.LicensePreviousPublicKey))
+		if err != nil || len(pub) != 32 || c.LicensePreviousKeyID == "" || c.LicensePreviousKeyValidUntil.IsZero() {
+			fatal = append(fatal, "previous signing key requires a 32-byte hex LICENSE_PREVIOUS_PUBLIC_KEY, LICENSE_PREVIOUS_KEY_ID, and LICENSE_PREVIOUS_KEY_VALID_UNTIL")
 		}
 	}
 
@@ -282,10 +417,7 @@ func (c *Config) ValidateSecurityDefaults() (warnings []string, fatal []string) 
 	case c.IsStorageEnabled() && c.ReleaseKeyEncryptionKey == "":
 		fatal = append(fatal, "RELEASE_KEY_ENCRYPTION_KEY is required when storage is enabled — generate via: openssl rand -hex 32")
 	case c.ReleaseKeyEncryptionKey == "":
-		// Not provided and not required — license encryption stays disabled,
-		// release signing isn't applicable. Surfaced as a warning since this
-		// disables a security feature.
-		warnings = append(warnings, "SECURITY: RELEASE_KEY_ENCRYPTION_KEY is not set — license keys are stored in plaintext")
+		fatal = append(fatal, "RELEASE_KEY_ENCRYPTION_KEY is required for ciphertext-only license-key storage — generate via: openssl rand -hex 32")
 	case len(c.ReleaseKeyEncryptionKey) != 64:
 		fatal = append(fatal, "RELEASE_KEY_ENCRYPTION_KEY must be exactly 64 hex chars (32 bytes for AES-256)")
 	default:
@@ -320,4 +452,25 @@ func envFloatOr(key string, fallback float64) float64 {
 		}
 	}
 	return fallback
+}
+
+func envBoolOr(key string, fallback bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(strings.TrimSpace(v))
+	if err != nil {
+		return fallback
+	}
+	return b
+}
+
+func envDurationOr(key, fallback string) (time.Duration, error) {
+	raw := envOr(key, fallback)
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a valid duration: %w", key, err)
+	}
+	return d, nil
 }

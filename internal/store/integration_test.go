@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	keycrypto "github.com/tabloy/keygate/internal/crypto"
 	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/store"
 )
@@ -24,6 +25,7 @@ func setupTestDB(t *testing.T) *store.Store {
 	if err := s.RunMigrations("../../db/migrations"); err != nil {
 		t.Fatalf("migrations failed: %v", err)
 	}
+	s.LicenseKeyAEAD = keycrypto.MustDeriveAEAD(make([]byte, 32), "license-key")
 	return s
 }
 
@@ -158,6 +160,83 @@ func TestIncrementUsageCounterWithLimit_Atomic(t *testing.T) {
 	}
 
 	_, _ = s.DB.NewRaw("DELETE FROM usage_counters WHERE license_id = ?", licenseID).Exec(ctx)
+}
+
+func TestConsumeOTPCode_Atomic(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	email := "otp-" + time.Now().Format("150405.000000") + "@example.com"
+	verifier := "hmac-verifier-for-test"
+	if err := s.CreateOTPCode(ctx, &model.OTPCode{
+		Email: email, CodeHash: verifier, ExpiresAt: time.Now().Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("create OTP: %v", err)
+	}
+
+	var successes int
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for range 12 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, matched, err := s.ConsumeOTPCode(ctx, email, verifier, "dummy")
+			if err != nil {
+				t.Errorf("consume: %v", err)
+				return
+			}
+			if matched {
+				mu.Lock()
+				successes++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if successes != 1 {
+		t.Fatalf("successful consumes=%d, want exactly 1", successes)
+	}
+}
+
+func TestCreateOTPCodeWithLimit_AtomicAcrossConnections(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	email := "otp-send-" + time.Now().Format("150405.000000") + "@example.com"
+
+	var created int
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for range 12 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok, err := s.CreateOTPCodeWithLimit(ctx, &model.OTPCode{
+				Email: email, CodeHash: "verifier", ExpiresAt: time.Now().Add(time.Minute),
+			}, 3)
+			if err != nil {
+				t.Errorf("create limited OTP: %v", err)
+				return
+			}
+			if ok {
+				mu.Lock()
+				created++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if created != 3 {
+		t.Fatalf("created OTP rows=%d, want exactly 3", created)
+	}
+	count, err := s.DB.NewSelect().Model((*model.OTPCode)(nil)).Where("email = ?", email).Count(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("persisted OTP rows=%d, want exactly 3", count)
+	}
 }
 
 func TestCreateLicenseWithSubscription_Atomic(t *testing.T) {
@@ -427,4 +506,30 @@ func TestUpdateLicenseAndSubscription_Atomic(t *testing.T) {
 	}
 
 	t.Log("license-subscription sync test passed")
+}
+
+func TestFinalizeLicenseKeyStorage_RejectsPlaintextWrites(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+
+	lic := createTestLicense(t, s, ctx)
+	if err := s.FinalizeLicenseKeyStorage(ctx, nil); err != nil {
+		t.Fatalf("finalize ciphertext-only storage: %v", err)
+	}
+
+	var plaintextRows int
+	if err := s.DB.NewRaw("SELECT count(*) FROM licenses WHERE license_key IS NOT NULL").Scan(ctx, &plaintextRows); err != nil {
+		t.Fatal(err)
+	}
+	if plaintextRows != 0 {
+		t.Fatalf("found %d plaintext license-key rows", plaintextRows)
+	}
+
+	if _, err := s.DB.NewRaw("UPDATE licenses SET license_key = ? WHERE id = ?", lic.LicenseKey, lic.ID).Exec(ctx); err == nil {
+		t.Fatal("database accepted a plaintext license key after finalization")
+	}
+	if got := s.DecryptLicenseKey(lic); got != lic.LicenseKey {
+		t.Fatalf("ciphertext reveal = %q, want original one-time key", got)
+	}
 }
