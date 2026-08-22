@@ -921,6 +921,7 @@ func main() {
 		licWrite.POST("/usage", middleware.Idempotency(db), usageH.RecordBillableUsage)
 		licWrite.GET("/licenses/export", adminH.ExportLicenses)
 		licWrite.GET("/licenses/:id", adminH.GetLicense)
+		licWrite.GET("/licenses/:id/key", adminH.RevealLicenseKey)
 		licWrite.POST("/licenses", adminH.CreateLicense)
 		licWrite.POST("/licenses/:id/refund", adminH.RefundLicense)
 		licWrite.POST("/licenses/:id/revoke", adminH.RevokeLicense)

@@ -822,7 +822,15 @@ func (h *AdminHandler) ListLicenses(c *gin.Context) {
 		response.Internal(c)
 		return
 	}
-	response.OK(c, gin.H{"licenses": licenses, "total": total})
+	// Only the tail of each key travels with the list; the key itself is
+	// fetched one at a time through RevealLicenseKey.
+	hints := make(map[string]string, len(licenses))
+	for _, l := range licenses {
+		if hint := h.licenseKeyHint(l); hint != "" {
+			hints[l.ID] = hint
+		}
+	}
+	response.OK(c, gin.H{"licenses": licenses, "total": total, "license_key_hints": hints})
 }
 
 func (h *AdminHandler) GetLicense(c *gin.Context) {
@@ -836,6 +844,56 @@ func (h *AdminHandler) GetLicense(c *gin.Context) {
 		return
 	}
 	response.OK(c, l)
+}
+
+// licenseKeyHint returns the last four characters of a license key so the UI
+// can distinguish rows without holding the credential. Keys are stored as
+// ciphertext only, so the tail has to be derived by decrypting server-side;
+// what leaves the process is four characters, never the key itself.
+func (h *AdminHandler) licenseKeyHint(l *model.License) string {
+	key := h.Store.DecryptLicenseKey(l)
+	if key == "" {
+		return ""
+	}
+	runes := []rune(key)
+	if len(runes) <= 4 {
+		return string(runes)
+	}
+	return string(runes[len(runes)-4:])
+}
+
+// RevealLicenseKey returns the plaintext license key for a single license.
+// The key is a credential — it activates the product — so it is never part of
+// the list or detail payloads: the admin UI fetches it here on an explicit
+// copy action, and every reveal is written to the audit log.
+func (h *AdminHandler) RevealLicenseKey(c *gin.Context) {
+	id := c.Param("id")
+	l, err := h.Store.FindLicenseByID(c, id)
+	if err != nil {
+		response.NotFound(c, "license not found")
+		return
+	}
+	if !requireKeyProductScope(c, l.ProductID) {
+		return
+	}
+	key := h.Store.DecryptLicenseKey(l)
+	if key == "" {
+		// Either the master key is missing or the ciphertext is unreadable;
+		// DecryptLicenseKey has already logged the cause and bumped the metric.
+		response.Err(c, http.StatusServiceUnavailable, "LICENSE_KEY_UNAVAILABLE",
+			"license key could not be decrypted")
+		return
+	}
+
+	// The audit entry records that a reveal happened, never the key itself.
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "license", EntityID: l.ID, Action: "key_revealed",
+		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(),
+		Changes: map[string]any{"email": l.Email},
+	})
+
+	c.Header("Cache-Control", "no-store")
+	response.OK(c, gin.H{"license_key": key})
 }
 
 func (h *AdminHandler) CreateLicense(c *gin.Context) {

@@ -192,9 +192,15 @@ export const admin = {
     if (params?.external_workspace_id) q.set("external_workspace_id", params.external_workspace_id)
     if (params?.offset) q.set("offset", String(params.offset))
     if (params?.limit) q.set("limit", String(params.limit))
-    return get<{ licenses: License[]; total: number }>(`/admin/licenses?${q}`)
+    return get<{ licenses: License[]; total: number; license_key_hints: Record<string, string> }>(
+      `/admin/licenses?${q}`,
+    )
   },
   getLicense: (id: string) => get<License>(`/admin/licenses/${id}`),
+  // License keys are credentials, so they are never part of the list or
+  // detail payloads — this fetches one on an explicit user action and the
+  // server writes an audit entry for every call.
+  revealLicenseKey: (id: string) => get<{ license_key: string }>(`/admin/licenses/${id}/key`),
   createLicense: (data: {
     product_id: string
     plan_id: string
