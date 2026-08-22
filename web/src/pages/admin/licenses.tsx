@@ -54,6 +54,49 @@ function localDateValue(iso: string): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
 }
 
+// License keys never travel with the list or detail payloads — they are
+// credentials that activate the product. This fetches one on an explicit
+// click, copies it, and leaves an audit entry server-side. `hint` is the
+// last four characters, enough to tell rows apart without holding the key.
+function LicenseKeyCopy({ id, hint, reveal = false }: { id: string; hint?: string; reveal?: boolean }) {
+  const { t } = useI18n()
+  const [copied, setCopied] = useState(false)
+  const [shown, setShown] = useState<string | null>(null)
+  const mut = useMutation({
+    mutationFn: () => admin.revealLicenseKey(id),
+    onSuccess: async (data) => {
+      if (reveal) setShown(data.license_key)
+      try {
+        await navigator.clipboard.writeText(data.license_key)
+        setCopied(true)
+        setTimeout(() => setCopied(false), 2000)
+      } catch {
+        // Clipboard can be blocked (insecure origin, denied permission).
+        // With reveal on, the key is on screen to copy by hand; without it,
+        // say so rather than silently doing nothing.
+        if (!reveal) showToast(t("licenses.keyCopyFailed"))
+      }
+    },
+    onError: () => showToast(t("licenses.keyUnavailable")),
+  })
+
+  return (
+    <div className="flex items-center gap-2">
+      <code className="text-xs bg-muted px-1.5 py-0.5 rounded">{shown || (hint ? `••••${hint}` : "••••••••")}</code>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="h-6 w-6"
+        disabled={mut.isPending}
+        title={t("licenses.copyKey")}
+        onClick={() => mut.mutate()}
+      >
+        {copied ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
+      </Button>
+    </div>
+  )
+}
+
 export default function LicensesPage() {
   const { t } = useI18n()
   const qc = useQueryClient()
@@ -81,6 +124,7 @@ export default function LicensesPage() {
 
   const products = productsData?.products || []
   const licenses = data?.licenses || []
+  const keyHints = data?.license_key_hints || {}
   const total = data?.total || 0
   const totalPages = Math.ceil(total / limit)
 
@@ -208,7 +252,7 @@ export default function LicensesPage() {
                     <DataTableRow key={lic.id}>
                       <DataTableCell className="font-medium">{lic.email}</DataTableCell>
                       <DataTableCell>
-                        <code className="text-xs bg-muted px-1.5 py-0.5 rounded">{lic.license_key}</code>
+                        <LicenseKeyCopy id={lic.id} hint={keyHints[lic.id]} />
                       </DataTableCell>
                       <DataTableCell className="text-muted-foreground">{lic.product?.name || "-"}</DataTableCell>
                       <DataTableCell className="text-muted-foreground">{lic.plan?.name || "-"}</DataTableCell>
@@ -433,7 +477,6 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
   const { t } = useI18n()
   const qc = useQueryClient()
   const { data: lic, isLoading } = useQuery({ queryKey: ["admin", "license", id], queryFn: () => admin.getLicense(id) })
-  const [copied, setCopied] = useState(false)
   const [changingPlan, setChangingPlan] = useState(false)
   // null = not editing; "" = editing with empty value (perpetual)
   const [editingValidUntil, setEditingValidUntil] = useState<string | null>(null)
@@ -481,14 +524,6 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
     },
   })
 
-  const copyKey = () => {
-    if (lic) {
-      navigator.clipboard.writeText(lic.license_key)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    }
-  }
-
   return (
     <Dialog open onOpenChange={onClose}>
       <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
@@ -512,11 +547,8 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
                 <div className="grid grid-cols-2 gap-4 text-sm">
                   <div>
                     <p className="text-muted-foreground">{t("licenses.licenseKey")}</p>
-                    <div className="flex items-center gap-2 mt-1">
-                      <code className="bg-muted px-2 py-1 rounded text-xs">{lic.license_key}</code>
-                      <Button variant="ghost" size="icon" className="h-6 w-6" onClick={copyKey}>
-                        {copied ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
-                      </Button>
+                    <div className="mt-1">
+                      <LicenseKeyCopy id={lic.id} reveal />
                     </div>
                   </div>
                   <div>
