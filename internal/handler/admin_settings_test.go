@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -34,15 +35,18 @@ func TestAdminSettingsIgnoresServerOwnedKeys(t *testing.T) {
 
 	ctx := context.Background()
 	cleanup := func() {
-		_, _ = s.DB.NewRaw("DELETE FROM settings WHERE key IN ('setup_complete', 'setup_bootstrap_consumed_at', 'logo_url')").Exec(ctx)
+		_, _ = s.DB.NewRaw("DELETE FROM settings WHERE key IN ('setup_complete', 'setup_bootstrap_consumed_at', 'stripe_webhook_endpoint_id', 'stripe_webhook_secret', 'logo_url')").Exec(ctx)
 	}
 	cleanup()
 	t.Cleanup(cleanup)
 
 	const consumedAt = "2026-08-21T21:00:00Z"
+	const webhookSecret = "whsec_live_signing_secret"
 	if err := s.SetSettings(ctx, map[string]string{
 		"setup_complete":              "true",
 		"setup_bootstrap_consumed_at": consumedAt,
+		"stripe_webhook_endpoint_id":  "we_123",
+		"stripe_webhook_secret":       webhookSecret,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -66,10 +70,13 @@ func TestAdminSettingsIgnoresServerOwnedKeys(t *testing.T) {
 	if err := json.Unmarshal(getRecorder.Body.Bytes(), &getBody); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"setup_complete", "setup_bootstrap_consumed_at"} {
+	for _, key := range []string{"setup_complete", "setup_bootstrap_consumed_at", "stripe_webhook_endpoint_id", "stripe_webhook_secret"} {
 		if _, ok := getBody.Data.Settings[key]; ok {
 			t.Fatalf("GET exposed server-owned key %q", key)
 		}
+	}
+	if strings.Contains(getRecorder.Body.String(), webhookSecret) {
+		t.Fatal("GET leaked the Stripe webhook signing secret")
 	}
 
 	put := func(body string) *httptest.ResponseRecorder {
@@ -81,7 +88,7 @@ func TestAdminSettingsIgnoresServerOwnedKeys(t *testing.T) {
 	}
 
 	// A client echoing the server-owned keys back must still save the rest.
-	if w := put(`{"settings":{"logo_url":"https://example.com/logo.png","setup_complete":"false","setup_bootstrap_consumed_at":"tampered"}}`); w.Code != http.StatusOK {
+	if w := put(`{"settings":{"logo_url":"https://example.com/logo.png","setup_complete":"false","setup_bootstrap_consumed_at":"tampered","stripe_webhook_secret":"whsec_attacker"}}`); w.Code != http.StatusOK {
 		t.Fatalf("put status=%d body=%s", w.Code, w.Body.String())
 	}
 	if got, err := s.GetSetting(ctx, "logo_url"); err != nil || got != "https://example.com/logo.png" {
@@ -93,6 +100,9 @@ func TestAdminSettingsIgnoresServerOwnedKeys(t *testing.T) {
 	}
 	if got, err := s.GetSetting(ctx, "setup_complete"); err != nil || got != "true" {
 		t.Fatalf("setup_complete=%q err=%v", got, err)
+	}
+	if got, err := s.GetSetting(ctx, "stripe_webhook_secret"); err != nil || got != webhookSecret {
+		t.Fatalf("stripe_webhook_secret=%q err=%v", got, err)
 	}
 
 	// Genuinely unknown keys are still rejected.
