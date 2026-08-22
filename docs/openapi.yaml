@@ -799,6 +799,13 @@ paths:
         like `max_activations`); use `checkout_id` with
         `GET /pay/:checkout_id` to send the customer to Stripe Checkout.
 
+        `price` and `currency` are not stored locally — Stripe Price
+        is the source of truth — so they're fetched from Stripe and
+        cached briefly server-side. If the Stripe lookup fails (or the
+        plan has no `stripe_price_id`, e.g. a manually-issued plan),
+        both are returned as `null`; the plan is still listed and
+        checkout remains the final source of truth for what's charged.
+
         Unknown `product_slug` returns 404 without differentiating
         "no such product" from other lookup failures, so slug guesses
         leak nothing.
@@ -834,6 +841,19 @@ paths:
                             checkout_id:
                               type: string
                               description: Pass to GET /pay/:checkout_id to start Stripe Checkout
+                            price:
+                              type: integer
+                              nullable: true
+                              description: |
+                                Minor currency units (e.g. cents), fetched live from
+                                Stripe. `null` if unavailable (no stripe_price_id, or
+                                the Stripe lookup failed).
+                              example: 2900
+                            currency:
+                              type: string
+                              nullable: true
+                              description: Lowercase ISO 4217 code, from Stripe. `null` if unavailable.
+                              example: usd
         "404":
           description: Unknown product_slug
         "429":
