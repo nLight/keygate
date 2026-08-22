@@ -84,6 +84,8 @@ tags:
     description: Concurrent session checkout for floating licenses
   - name: Releases
     description: License-gated download + auto-update feeds (Sparkle / Velopack / Tauri)
+  - name: Products
+    description: Public product/plan catalog for building a pricing page
 
 paths:
   /license/pubkey:
@@ -784,6 +786,58 @@ paths:
           description: Invalid platform / channel
         "404":
           description: Unknown product_slug
+
+  /products/{product_slug}/plans:
+    get:
+      tags: [Products]
+      summary: List active plans for a product (public)
+      description: |
+        Returns active, publicly-sellable plans for a product — the
+        catalog used to build a pricing / plan-selection page. Public,
+        unauthenticated, rate-limited by IP. Response fields are
+        intentionally trimmed (no Stripe secrets, no internal limits
+        like `max_activations`); use `checkout_id` with
+        `GET /pay/:checkout_id` to send the customer to Stripe Checkout.
+
+        Unknown `product_slug` returns 404 without differentiating
+        "no such product" from other lookup failures, so slug guesses
+        leak nothing.
+      parameters:
+        - $ref: "#/components/parameters/ProductSlug"
+      responses:
+        "200":
+          description: Active plans
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      plans:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: string, format: uuid }
+                            name: { type: string, example: "Pro" }
+                            slug: { type: string, example: "pro" }
+                            license_type:
+                              type: string
+                              example: "subscription"
+                            billing_interval:
+                              type: string
+                              example: "monthly"
+                            stripe_price_id: { type: string }
+                            checkout_id:
+                              type: string
+                              description: Pass to GET /pay/:checkout_id to start Stripe Checkout
+        "404":
+          description: Unknown product_slug
+        "429":
+          description: Rate limit exceeded
 
 components:
   parameters:

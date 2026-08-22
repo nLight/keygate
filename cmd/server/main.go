@@ -603,6 +603,43 @@ func main() {
 	v1.GET("/releases/upgrade.json", feedGone)
 	v1.GET("/releases/feed", feedGone)
 
+	// Public plan listing for building a pricing / plan-selection page.
+	// No auth: this is meant to be called by anonymous visitors before
+	// they have a license or account. Same field trim as portal/plans —
+	// no Stripe secrets, no internal limits, just what a pricing page needs.
+	v1.GET("/products/:product_slug/plans",
+		middleware.RateLimitByIP(cfg.RateLimitAPI, time.Minute),
+		func(c *gin.Context) {
+			slug := strings.ToLower(strings.TrimSpace(c.Param("product_slug")))
+			if slug == "" {
+				response.BadRequest(c, "product_slug is required")
+				return
+			}
+			prod, err := db.FindProductBySlug(c, slug)
+			if err != nil {
+				// Don't differentiate "no such product" from "other DB error" —
+				// guesses at slugs leak nothing.
+				response.NotFound(c, "product not found")
+				return
+			}
+			plans, err := db.ListPlans(c, prod.ID, "")
+			if err != nil {
+				response.Internal(c)
+				return
+			}
+			active := []gin.H{}
+			for _, p := range plans {
+				if p.Active {
+					active = append(active, gin.H{
+						"id": p.ID, "name": p.Name, "slug": p.Slug,
+						"license_type": p.LicenseType, "billing_interval": p.BillingInterval,
+						"stripe_price_id": p.StripePriceID, "checkout_id": p.CheckoutID,
+					})
+				}
+			}
+			response.OK(c, gin.H{"plans": active})
+		})
+
 	auth := v1.Group("/auth", middleware.RateLimitByIP(cfg.RateLimitAuth, time.Minute))
 	{
 		auth.GET("/providers", authH.Providers)
