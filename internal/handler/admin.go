@@ -1730,15 +1730,18 @@ func (h *AdminHandler) ChangeLicensePlan(c *gin.Context) {
 
 // ─── Settings ───
 
-// internalSettingKeys are written by the server itself during first-run
-// setup. They must not round-trip through the admin settings form: the UI
-// loads GET /admin/settings straight into form state and posts the whole
-// map back, so anything exposed here has to be writable — these are not.
-// setup_bootstrap_consumed_at in particular is an audit trail of when the
-// bootstrap secret was spent.
+// internalSettingKeys are written by the server itself — first-run setup and
+// Stripe webhook auto-provisioning — and must not round-trip through the
+// admin settings form. The UI loads GET /admin/settings straight into form
+// state and posts the whole map back, so anything exposed here has to be
+// writable, and these are not: setup_bootstrap_consumed_at is the audit
+// trail of when the bootstrap secret was spent, and stripe_webhook_secret
+// is a live signing secret that has no business reaching a browser.
 var internalSettingKeys = map[string]bool{
 	"setup_complete":              true,
 	"setup_bootstrap_consumed_at": true,
+	"stripe_webhook_endpoint_id":  true,
+	"stripe_webhook_secret":       true,
 }
 
 func (h *AdminHandler) GetSettings(c *gin.Context) {
