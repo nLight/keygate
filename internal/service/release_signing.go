@@ -85,7 +85,7 @@ func NewReleaseSigningService(c ReleaseSigningServiceConfig) *ReleaseSigningServ
 // ─── Sentinel errors ───
 
 var (
-	ErrSigningDisabled        = errors.New("release signing is not configured (RELEASE_KEY_ENCRYPTION_KEY missing)")
+	ErrSigningDisabled        = errors.New("release signing is not configured (no master encryption key wired into the service)")
 	ErrArtifactTooLargeToSign = errors.New("artifact exceeds the configured signing size limit")
 	ErrSigningKeyMissing      = errors.New("product has no active signing key — generate one before signing")
 	ErrArtifactNotInStorage   = errors.New("artifact bytes not found in storage; upload may not be finalized")
@@ -102,9 +102,10 @@ var (
 // a fresh COPY (not the underlying buffer), so zeroing it has no effect —
 // don't be misled by older versions of this code.
 //
-// Nil receiver: when storage isn't configured the service is wired as nil
-// (see main.go). All public methods short-circuit to ErrSigningDisabled
-// rather than panic, so handlers can map cleanly to a 503.
+// Nil receiver: a service wired without an AEAD (or a nil service) short-
+// circuits every public method to ErrSigningDisabled rather than panic, so
+// handlers can map cleanly to a 503. Note that a disabled OBJECT STORE does
+// not disable key management — only SignArtifact needs storage.
 func (s *ReleaseSigningService) GenerateForProduct(ctx context.Context, productID string) (*model.ReleaseSigningKey, error) {
 	if s == nil || s.aead == nil {
 		return nil, ErrSigningDisabled
@@ -327,6 +328,9 @@ func (s *ReleaseSigningService) SignArtifact(ctx context.Context, rel *model.Rel
 		if errors.Is(err, storage.ErrObjectNotFound) {
 			return nil, ErrArtifactNotInStorage
 		}
+		// Keys can be generated without an object store; reading the bytes
+		// to sign cannot. Keep ErrStorageDisabled in the chain so callers
+		// can report the real cause instead of a 500.
 		return nil, fmt.Errorf("storage get: %w", err)
 	}
 	defer body.Close()

@@ -149,6 +149,27 @@ func TestSigningServiceProductIDRequired(t *testing.T) {
 	}
 }
 
+// A disabled object store must not disable KEY MANAGEMENT: generating,
+// rotating and exporting keys only needs the DB plus the master key. Only
+// SignArtifact reads artifact bytes, so only it depends on storage.
+func TestSigningKeyManagementIndependentOfStorage(t *testing.T) {
+	svc := NewReleaseSigningService(ReleaseSigningServiceConfig{
+		Store:   nil,
+		Storage: storage.Disabled{},
+		AEAD:    mustAEAD(t),
+	})
+
+	// Empty product_id short-circuits before the store is touched; what
+	// matters is that the failure is the argument check, never
+	// ErrSigningDisabled.
+	if _, err := svc.GenerateForProduct(context.Background(), ""); errors.Is(err, ErrSigningDisabled) {
+		t.Error("Generate: storage-disabled must not disable key generation")
+	}
+	if _, err := svc.RotateForProduct(context.Background(), "", "n"); errors.Is(err, ErrSigningDisabled) {
+		t.Error("Rotate: storage-disabled must not disable key rotation")
+	}
+}
+
 func TestSigningServiceMaxSignSize(t *testing.T) {
 	// signLocal isn't quite right for this test — we want to test the
 	// SignArtifact path's size limit. Skip this branch for now since we'd

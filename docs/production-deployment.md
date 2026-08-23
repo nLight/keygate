@@ -26,6 +26,12 @@ the procedure is restart-safe. After a successful restart and backup, remove
 the previous key and restart once more to verify recovery no longer depends on
 it. Losing both keys fails startup/reveal and never falls back to plaintext.
 
+Per-product release signing keys can be generated, rotated and exported as soon
+as `RELEASE_KEY_ENCRYPTION_KEY` is set — object storage is not required for key
+management. Signing artifacts at publish time does read the uploaded bytes, so
+it additionally needs `STORAGE_BUCKET`, `STORAGE_ACCESS_KEY` and
+`STORAGE_SECRET_KEY`; without them publish returns `STORAGE_DISABLED`.
+
 For first-run setup only, set `SETUP_ENABLED=true` and provide a random
 `BOOTSTRAP_SECRET` of at least 32 characters out of band. Send it in the
 `bootstrap_secret` field of `POST /api/v1/setup/initialize`. After the request

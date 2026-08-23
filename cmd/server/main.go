@@ -172,7 +172,9 @@ func main() {
 	//   - "license-key":                 AEAD over license_key plaintext at rest.
 	//                                    Works even when storage is disabled.
 	//   - "release-signing-private-key": AEAD over per-product Ed25519
-	//                                    private keys. Requires storage.
+	//                                    private keys. Key management works
+	//                                    without storage; signing artifacts
+	//                                    needs it.
 	//
 	// Subkeys are purpose-isolated — ciphertext from one cannot decrypt
 	// under another.
@@ -226,16 +228,24 @@ func main() {
 				log.Fatalf("startup key maintenance: %v", err)
 			}
 
-			// Release signing requires storage in addition to the master key.
+			// Key management (generate/rotate/export) needs only the DB and
+			// the master key — storage is required solely to READ artifact
+			// bytes at sign time. Wiring the service unconditionally lets an
+			// operator provision keys before storage is configured; when
+			// storage is off, releaseStorage is storage.Disabled{} and
+			// SignArtifact reports STORAGE_DISABLED per-request, the same
+			// way the rest of the release subsystem does.
+			releaseSigner = service.NewReleaseSigningService(service.ReleaseSigningServiceConfig{
+				Store:       db,
+				Storage:     releaseStorage,
+				AEAD:        releaseAEAD,
+				Logger:      logger,
+				MaxSignSize: cfg.MaxReleaseSignSize,
+			})
 			if cfg.IsStorageEnabled() {
-				releaseSigner = service.NewReleaseSigningService(service.ReleaseSigningServiceConfig{
-					Store:       db,
-					Storage:     releaseStorage,
-					AEAD:        releaseAEAD,
-					Logger:      logger,
-					MaxSignSize: cfg.MaxReleaseSignSize,
-				})
 				logger.Info("release signing: enabled", "max_sign_mb", cfg.MaxReleaseSignSize/(1024*1024))
+			} else {
+				logger.Info("release signing: key management enabled; artifact signing needs storage (STORAGE_BUCKET/ACCESS_KEY/SECRET_KEY)")
 			}
 		}
 	} else {

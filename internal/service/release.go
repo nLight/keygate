@@ -547,6 +547,11 @@ func (s *ReleaseService) Publish(ctx context.Context, releaseID string) (*model.
 				case errors.Is(err, ErrArtifactNotInStorage):
 					return nil, apperr.New(409, "ARTIFACT_MISSING",
 						fmt.Sprintf("artifact for platform %q is missing in storage", a.Platform))
+				case errors.Is(err, storage.ErrStorageDisabled):
+					// Signing keys exist (they don't need storage), but the
+					// artifact bytes are unreachable without an object store.
+					return nil, apperr.New(503, "STORAGE_DISABLED",
+						"release storage is not configured — artifacts cannot be signed")
 				default:
 					s.logger.Error("publish: sign failed",
 						"release_id", rel.ID, "artifact_id", a.ID, "error", err)
