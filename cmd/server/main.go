@@ -627,7 +627,14 @@ func main() {
 	auth := v1.Group("/auth", middleware.RateLimitByIP(cfg.RateLimitAuth, time.Minute))
 	{
 		auth.GET("/providers", authH.Providers)
-		auth.POST("/otp/send", authH.OTPSend)
+		// Its own bucket, and an hour wide rather than a minute: this
+		// is the only endpoint that mails a caller-chosen address, so
+		// it needs a budget an order of magnitude tighter than the
+		// group's. Sharing the group's "ip:<addr>" counter would mean
+		// the two limiters fight over whose rate and window win.
+		auth.POST("/otp/send",
+			middleware.RateLimitByIPScoped("otp_send", cfg.RateLimitOTPSend, time.Hour),
+			authH.OTPSend)
 		auth.POST("/otp/verify", authH.OTPVerify)
 		auth.POST("/dev-login", authH.DevLogin)
 		auth.POST("/logout", middleware.SessionAuth(cfg.JWTSecret, db.FindUserIsAdmin), authH.Logout)

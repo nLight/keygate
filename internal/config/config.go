@@ -76,6 +76,16 @@ type Config struct {
 	RateLimitAPI   int
 	RateLimitAdmin int
 	RateLimitAuth  int
+	// RateLimitOTPSend caps /auth/otp/send per IP per HOUR — not per
+	// minute like the others. This is the one endpoint that mails an
+	// address the caller supplies, so a per-minute budget is the wrong
+	// shape entirely: 20/minute is 1200 messages an hour aimed at
+	// third parties, and the bounces land on the operator's sending
+	// reputation, not the sender's.
+	//
+	// 30/hour rather than something stricter because one IP is often
+	// one office behind NAT.
+	RateLimitOTPSend int
 
 	// Brute-force protection on /license/* — caps repeated bad license
 	// keys per IP. In tests these defaults are too tight, so they're
@@ -213,6 +223,7 @@ func Load() (*Config, error) {
 	cfg.RateLimitAPI = envIntOr("RATE_LIMIT_API", 60)
 	cfg.RateLimitAdmin = envIntOr("RATE_LIMIT_ADMIN", 120)
 	cfg.RateLimitAuth = envIntOr("RATE_LIMIT_AUTH", 20)
+	cfg.RateLimitOTPSend = envIntOr("RATE_LIMIT_OTP_SEND", 30)
 	cfg.BFMaxFails = envIntOr("BF_MAX_FAILS", 5)
 	cfg.BFLockoutSeconds = envIntOr("BF_LOCKOUT_SECONDS", 30)
 
