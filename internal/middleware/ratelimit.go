@@ -28,8 +28,13 @@ type memoryBackend struct {
 }
 
 type visitor struct {
-	count    int
-	lastSeen time.Time
+	count int
+	// windowStart is when the current window opened and window is the
+	// length it opened with. The sweeper needs both: a counter whose
+	// window is still running must survive, or deleting it hands the
+	// caller a fresh allowance.
+	windowStart time.Time
+	window      time.Duration
 }
 
 func NewMemoryBackend() RateLimitBackend {
@@ -50,22 +55,38 @@ func (mb *memoryBackend) Allow(key string, rate int, window time.Duration) bool 
 	v, exists := mb.visitors[key]
 	now := time.Now()
 
-	if !exists || now.Sub(v.lastSeen) > window {
-		mb.visitors[key] = &visitor{count: 1, lastSeen: now}
+	// Fixed window, matching the Redis backend's INCR+EXPIRE: the
+	// counter resets `window` after it opened, not after the caller
+	// falls silent. Resetting on idle meant the two backends disagreed
+	// about the same budget, and that a caller who kept trying never
+	// rolled over — they stayed locked out until they went quiet for a
+	// whole window, which on the hour-long OTP budget is an hour of
+	// silence from an entire NATed office.
+	if !exists || now.Sub(v.windowStart) >= window {
+		mb.visitors[key] = &visitor{count: 1, windowStart: now, window: window}
 		return true
 	}
 
-	v.lastSeen = now
 	v.count++
 	return v.count <= rate
 }
 
+// cleanup drops counters whose window has already closed. It has to
+// respect each entry's own window: a flat threshold shorter than the
+// window deletes counters that are still live, which is not a leak but
+// a bypass — the caller comes back to a clean slate. The old fixed
+// 5-minute sweep turned an hour-long budget of 30 into "30 sends per
+// five idle minutes", roughly twelve times what it advertises.
 func (mb *memoryBackend) cleanup() {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
-	threshold := time.Now().Add(-5 * time.Minute)
+	now := time.Now()
 	for key, v := range mb.visitors {
-		if v.lastSeen.Before(threshold) {
+		// Short windows linger a little so the map is not rebuilt on
+		// every sweep. The entry is expired either way, so holding it
+		// costs nothing but a map slot.
+		ttl := max(v.window, 5*time.Minute)
+		if now.Sub(v.windowStart) > ttl {
 			delete(mb.visitors, key)
 		}
 	}
@@ -148,8 +169,23 @@ func RateLimit(rate int, window time.Duration) gin.HandlerFunc {
 
 // RateLimitByIP creates a rate limiter keyed by IP only.
 func RateLimitByIP(rate int, window time.Duration) gin.HandlerFunc {
+	return RateLimitByIPScoped("", rate, window)
+}
+
+// RateLimitByIPScoped is RateLimitByIP with a counter of its own.
+//
+// RateLimitByIP buckets on "ip:<addr>" alone, so two of them on one
+// route share a single counter and fight over whose rate and window
+// win. A scope gives an endpoint that needs a tighter budget than its
+// group — /auth/otp/send, which mails an address the caller chose — a
+// bucket of its own instead of eating into the shared one.
+func RateLimitByIPScoped(scope string, rate int, window time.Duration) gin.HandlerFunc {
+	prefix := "ip:"
+	if scope != "" {
+		prefix = "ip:" + scope + ":"
+	}
 	return func(c *gin.Context) {
-		if !defaultBackend.Allow("ip:"+c.ClientIP(), rate, window) {
+		if !defaultBackend.Allow(prefix+c.ClientIP(), rate, window) {
 			RateLimitRejections.Inc()
 			abortWithError(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
 			return

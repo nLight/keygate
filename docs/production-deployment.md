@@ -45,6 +45,16 @@ OTP login is closed to unknown users by default in production. Keep
 and domains in `OTP_ALLOWED_DOMAINS` remain eligible. Production startup fails
 when OTP is enabled without SMTP delivery.
 
+`POST /auth/otp/send` carries its own budget, `RATE_LIMIT_OTP_SEND` (default 30)
+per IP per **hour** — not per minute like the other limits. It is the only
+endpoint that mails a caller-supplied address, so a loose budget turns the
+install into a mail cannon aimed at third parties and the bounces land on your
+sending reputation. Without `REDIS_URL` the counter is per process, so N
+replicas allow N × the configured budget; set `REDIS_URL` to make it one shared
+budget. Raise the default only for an install whose users sit behind a large
+NAT, and prefer `OTP_OPEN_REGISTRATION=false` as the actual stop on mailing
+strangers — the cap only bounds the damage.
+
 ## Offline token and key rotation policy
 
 `OFFLINE_TOKEN_TTL` defaults to 24 hours. A dated license token expires at the

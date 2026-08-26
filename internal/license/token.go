@@ -36,11 +36,26 @@ type VerifyToken struct {
 	Identifier    string         `json:"did"`
 	Features      map[string]any `json:"ftr,omitempty"`
 	IssuedAt      int64          `json:"iat"`
-	ExpiresAt     int64          `json:"exp"`
-	ValidUntil    int64          `json:"vld,omitempty"`
-	GraceDays     int            `json:"grc"`
-	Nonce         string         `json:"nce"`           // unique per-issuance to prevent replay
-	Fingerprint   string         `json:"fpr,omitempty"` // SHA256(identifier+product_id) for binding
+	// ExpiresAt is the token's own lifetime — how long a client may
+	// stay offline before it has to check in again. It is NOT the
+	// license's end date; see ValidUntil.
+	ExpiresAt int64 `json:"exp"`
+	// ValidUntil is when the license itself lapses, as a unix second.
+	// Zero (field omitted) means perpetual. It lives inside the signed
+	// payload because the surrounding JSON envelope is not signed: an
+	// offline client reading the end date from there cannot tell a
+	// real one from one a proxy rewrote on the way. ExpiresAt cannot
+	// stand in for it — that is a check-in interval and says nothing
+	// about the licence term.
+	//
+	// The claim is "vun" to match upstream tabloy/keygate, which
+	// arrived at the same field independently under that name. No
+	// client had shipped against our earlier "vld", and one wire name
+	// for one concept is worth more than the old spelling.
+	ValidUntil  int64  `json:"vun,omitempty"`
+	GraceDays   int    `json:"grc"`
+	Nonce       string `json:"nce"`           // unique per-issuance to prevent replay
+	Fingerprint string `json:"fpr,omitempty"` // SHA256(identifier+product_id) for binding
 }
 
 type VerifyOptions struct {
