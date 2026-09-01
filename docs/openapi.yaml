@@ -708,6 +708,12 @@ paths:
         (no auth); non-stable channels are also public — internal
         / customer-specific builds belong on internal CI/CD
         distribution, not these feeds.
+
+        When the product has a `minimum_supported_version`, every item
+        carries `<sparkle:criticalUpdate sparkle:version="{floor}"/>`.
+        Sparkle 2 treats the update as critical only for hosts below
+        that version. There is no appcast field for
+        `minimum_supported_message`; Sparkle shows the release notes.
       parameters:
         - $ref: "#/components/parameters/ProductSlug"
         - $ref: "#/components/parameters/Platform"

@@ -304,3 +304,72 @@ func TestIsValidFeedFormat(t *testing.T) {
 		}
 	}
 }
+
+// The product's version floor reaches Sparkle clients as
+// <sparkle:criticalUpdate sparkle:version="…"/>. The attribute is what makes
+// it a floor rather than a blanket "every update is critical", so assert the
+// attribute is actually on the element and not merely that the element exists.
+func TestRenderSparkleCarriesTheVersionFloor(t *testing.T) {
+	in := FeedInput{
+		ProductID:               "prod-1",
+		ProductName:             "MyApp",
+		BaseURL:                 "https://example.com",
+		MinimumSupportedVersion: "1.10.0",
+		Releases: []*FeedRelease{
+			mkRelease("1.12.945"),
+			mkRelease("1.11.900"),
+		},
+	}
+
+	body, err := RenderSparkle(in)
+	if err != nil {
+		t.Fatalf("RenderSparkle: %v", err)
+	}
+	got := string(body)
+
+	// Every item carries it: whether an update is critical depends on the host
+	// version it is coming from, not on which release it is going to.
+	if n := strings.Count(got, `<sparkle:criticalUpdate sparkle:version="1.10.0">`); n != 2 {
+		t.Errorf("want the floor on both items, got %d occurrences in:\n%s", n, got)
+	}
+
+	// The <sparkle:tags> form carries no attributes, so Sparkle would read it
+	// as critical for every host regardless of the floor. It must not be used.
+	if strings.Contains(got, "sparkle:tags") {
+		t.Errorf("floor must not be emitted as a tags entry:\n%s", got)
+	}
+
+	if !xmlIsWellFormed(got) {
+		t.Errorf("appcast is not well-formed XML:\n%s", got)
+	}
+}
+
+func TestRenderSparkleOmitsTheFloorWhenUnset(t *testing.T) {
+	in := FeedInput{
+		ProductID:   "prod-1",
+		ProductName: "MyApp",
+		BaseURL:     "https://example.com",
+		Releases:    []*FeedRelease{mkRelease("1.12.945")},
+	}
+
+	body, err := RenderSparkle(in)
+	if err != nil {
+		t.Fatalf("RenderSparkle: %v", err)
+	}
+	if got := string(body); strings.Contains(got, "criticalUpdate") {
+		t.Errorf("no floor configured, so no criticalUpdate element:\n%s", got)
+	}
+}
+
+// xmlIsWellFormed reports whether the whole document parses. Sparkle's parser
+// is strict, and a malformed namespace prefix on a hand-written element name
+// is exactly the kind of thing that only shows up on the client.
+func xmlIsWellFormed(doc string) bool {
+	decoder := xml.NewDecoder(strings.NewReader(doc))
+	for {
+		_, err := decoder.Token()
+		if err != nil {
+			return err.Error() == "EOF"
+		}
+	}
+}

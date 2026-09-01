@@ -43,9 +43,15 @@ type FeedInput struct {
 	Releases    []*FeedRelease
 
 	// MinimumSupportedVersion: optional product-level version floor.
-	// Embedded in formats that allow extension (Tauri). Sparkle's strict
-	// XML schema and Velopack's array shape don't carry it; clients on
-	// those formats consult the dedicated policy endpoint.
+	// Embedded in formats that allow extension (Tauri) and, as of
+	// sparkle:criticalUpdate, in the Sparkle appcast — see RenderSparkle for
+	// what Sparkle does and does not enforce with it. Velopack's array shape
+	// still doesn't carry it; clients on that format consult the dedicated
+	// policy endpoint.
+	//
+	// MinimumSupportedMessage has no Sparkle equivalent: the appcast has
+	// nowhere to put a floor-specific message, and Sparkle renders the
+	// release notes instead. It stays a Tauri-only field.
 	MinimumSupportedVersion string
 	MinimumSupportedMessage string
 }
@@ -87,12 +93,27 @@ type sparkleChannel struct {
 }
 
 type sparkleItem struct {
-	Title           string             `xml:"title"`
-	PubDate         string             `xml:"pubDate,omitempty"`
-	SparkleVersion  string             `xml:"sparkle:version,omitempty"`
-	SparkleShortVer string             `xml:"sparkle:shortVersionString,omitempty"`
-	Description     sparkleDescription `xml:"description"`
-	Enclosure       sparkleEnclosure   `xml:"enclosure"`
+	Title           string                 `xml:"title"`
+	PubDate         string                 `xml:"pubDate,omitempty"`
+	SparkleVersion  string                 `xml:"sparkle:version,omitempty"`
+	SparkleShortVer string                 `xml:"sparkle:shortVersionString,omitempty"`
+	SparkleCritical *sparkleCriticalUpdate `xml:"sparkle:criticalUpdate,omitempty"`
+	Description     sparkleDescription     `xml:"description"`
+	Enclosure       sparkleEnclosure       `xml:"enclosure"`
+}
+
+// sparkleCriticalUpdate carries the product's version floor.
+//
+// It MUST be the standalone <sparkle:criticalUpdate sparkle:version="X"/>
+// element and not a <sparkle:tags><sparkle:criticalUpdate/></sparkle:tags>
+// entry. Sparkle reads attributes only from the standalone form; the tags
+// form yields an empty dictionary, which it treats as critical for EVERY
+// host regardless of the version they are updating from
+// (SUAppcastItem.m, and SPUAppcastItemStateResolver
+// -isCriticalUpdateWithCriticalUpdateDictionary:).
+type sparkleCriticalUpdate struct {
+	XMLName xml.Name `xml:"sparkle:criticalUpdate"`
+	Version string   `xml:"sparkle:version,attr,omitempty"`
 }
 
 type sparkleDescription struct {
@@ -122,6 +143,27 @@ var sparkleSigPattern = regexp.MustCompile(`^[A-Za-z0-9+/]{86,88}={0,2}$`)
 // of the 64-byte Ed25519 signature. If the model holds a value not matching
 // that shape we omit the attribute rather than emit a malformed signature
 // that would cause Sparkle to reject the entire item.
+//
+// Version floor: when the product sets a MinimumSupportedVersion, every item
+// carries <sparkle:criticalUpdate sparkle:version="{floor}"/>. Sparkle marks
+// an update critical only for hosts BELOW that version —
+//
+//	// Update is only critical when coming from previous versions
+//	return ([_applicationVersionComparator compareVersion:_hostVersion
+//	                                           toVersion:criticalVersion] == NSOrderedAscending);
+//
+// — which is precisely the population minimum_supported_version is about. The
+// attribute is a floor, not a property of the release, so it goes on every
+// item: whether an update is critical depends on where the host is coming
+// from, not on which release it is going to.
+//
+// What this buys, and what it does not: Sparkle escalates the update for hosts
+// below the floor (presented immediately, not skippable, installed without the
+// usual deferral) — it does not stop an out-of-date build from continuing to
+// run, and the standalone element's version attribute is read by Sparkle 2
+// only, so 1.x hosts see no floor at all. A client that must hard-block below
+// the floor still consults the policy endpoint; this only means the common
+// case no longer needs one.
 func RenderSparkle(in FeedInput) ([]byte, error) {
 	feed := sparkleAppcast{
 		Version:      "2.0",
@@ -133,6 +175,11 @@ func RenderSparkle(in FeedInput) ([]byte, error) {
 			Description: in.ProductName + " release feed",
 			Language:    "en",
 		},
+	}
+
+	var critical *sparkleCriticalUpdate
+	if in.MinimumSupportedVersion != "" {
+		critical = &sparkleCriticalUpdate{Version: in.MinimumSupportedVersion}
 	}
 
 	for _, r := range in.Releases {
@@ -154,6 +201,7 @@ func RenderSparkle(in FeedInput) ([]byte, error) {
 			PubDate:         pubDate,
 			SparkleVersion:  rel.Version,
 			SparkleShortVer: rel.Version,
+			SparkleCritical: critical,
 			Description: sparkleDescription{
 				Body: sanitizeCDATA(rel.ReleaseNotes),
 			},
