@@ -910,3 +910,31 @@ export const RELEASE_PLATFORMS = [
 ] as const
 
 export const RELEASE_CHANNELS = ["stable", "beta", "alpha", "dev"] as const
+
+// ─── Public update-feed URLs ───
+//
+// Feeds are unauthenticated by design — trust comes from the artifact's
+// ed25519 signature, not from URL secrecy — so these are plain links an
+// admin can open in a browser or paste into a client app's updater config.
+export const RELEASE_FEED_FORMATS = [
+  { id: "sparkle", label: "Sparkle", detail: "appcast XML — SUFeedURL", path: "feed.xml" },
+  { id: "velopack", label: "Velopack", detail: "releases JSON", path: "feed.json" },
+  { id: "tauri", label: "Tauri", detail: "updater JSON (latest only)", path: "upgrade.json" },
+] as const
+
+export type ReleaseFeedFormat = (typeof RELEASE_FEED_FORMATS)[number]["id"]
+
+// Absolute URL: these get pasted into Info.plist / tauri.conf.json, where
+// a root-relative path is meaningless. BASE is already absolute when
+// VITE_API_URL points at a separate API host.
+export function releaseFeedURL(
+  format: ReleaseFeedFormat,
+  productSlug: string,
+  platform: string,
+  channel: string,
+): string {
+  const path = RELEASE_FEED_FORMATS.find((f) => f.id === format)?.path || "feed.xml"
+  const origin = BASE.startsWith("http") ? "" : window.location.origin
+  const query = new URLSearchParams({ platform, channel })
+  return `${origin}${BASE}/releases/${encodeURIComponent(productSlug)}/${path}?${query.toString()}`
+}
