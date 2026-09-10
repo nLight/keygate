@@ -5,11 +5,13 @@ import {
   ChevronRight,
   Copy,
   Download,
+  ExternalLink,
   KeyRound,
   Package,
   Plus,
   Rocket,
   RotateCw,
+  Rss,
   Trash2,
   Upload,
   X,
@@ -52,11 +54,14 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import {
   admin,
+  type Product,
   RELEASE_CHANNELS,
+  RELEASE_FEED_FORMATS,
   RELEASE_PLATFORMS,
   type Release,
   type ReleaseArtifact,
   type ReleaseSigningKey,
+  releaseFeedURL,
 } from "@/lib/api"
 import { formatDate } from "@/lib/utils"
 
@@ -73,6 +78,7 @@ export default function ReleasesPage() {
   const [unyanking, setUnyanking] = useState<Release | null>(null)
   const [deleting, setDeleting] = useState<Release | null>(null)
   const [showSigningKeys, setShowSigningKeys] = useState(false)
+  const [showFeedUrls, setShowFeedUrls] = useState(false)
   const [openRelease, setOpenRelease] = useState<Release | null>(null)
   const [confirmPublish, setConfirmPublish] = useState<{ rel: Release; latest: string } | null>(null)
 
@@ -178,6 +184,9 @@ export default function ReleasesPage() {
           </p>
         </div>
         <div className="flex gap-2">
+          <Button variant="outline" onClick={() => setShowFeedUrls(true)}>
+            <Rss className="h-4 w-4 mr-2" /> Feed URLs
+          </Button>
           <Button variant="outline" onClick={() => setShowSigningKeys(true)}>
             <KeyRound className="h-4 w-4 mr-2" /> Signing keys
           </Button>
@@ -391,6 +400,7 @@ export default function ReleasesPage() {
         </AlertDialog>
       )}
       {showSigningKeys && <SigningKeysDialog products={products} onClose={() => setShowSigningKeys(false)} />}
+      {showFeedUrls && <FeedUrlsDialog products={products} onClose={() => setShowFeedUrls(false)} />}
       {deleting && (
         <AlertDialog open onOpenChange={() => setDeleting(null)}>
           <AlertDialogContent>
@@ -452,6 +462,154 @@ function StatusBadge({ status, yankedReason }: { status: string; yankedReason?: 
       {status === "yanked" && <AlertTriangle className="h-3 w-3 mr-1" />}
       {status}
     </Badge>
+  )
+}
+
+// ─── Feed URLs ────────────────────────────────────────────────────────────
+//
+// The update feeds are public GET endpoints, so the admin UI can hand out
+// plain browsable links: paste into Sparkle's SUFeedURL / Tauri's updater
+// endpoints, or just open one to eyeball what clients are being served.
+// `platform` is required by the backend and `channel` defaults to stable —
+// we always emit both so a copied URL is unambiguous.
+
+function FeedUrlRow({
+  slug,
+  platform,
+  channel,
+  format,
+}: {
+  slug: string
+  platform: string
+  channel: string
+  format: (typeof RELEASE_FEED_FORMATS)[number]
+}) {
+  const [copied, setCopied] = useState(false)
+  const url = releaseFeedURL(format.id, slug, platform, channel)
+
+  const copy = () => {
+    navigator.clipboard.writeText(url)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+
+  return (
+    <div>
+      <div className="flex items-baseline gap-2">
+        <Label className="text-xs">{format.label}</Label>
+        <span className="text-[11px] text-muted-foreground">{format.detail}</span>
+      </div>
+      <div className="flex items-center gap-2 mt-1 bg-muted rounded-md px-3 py-2">
+        <code className="text-xs flex-1 truncate font-mono" title={url}>
+          {url}
+        </code>
+        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={copy} title="Copy URL">
+          {copied ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
+        </Button>
+        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" asChild title="Open in a new tab">
+          <a href={url} target="_blank" rel="noreferrer">
+            <ExternalLink className="h-3 w-3" />
+          </a>
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function FeedLinks({ slug, platform, channel }: { slug: string; platform: string; channel: string }) {
+  return (
+    <div className="space-y-3">
+      {RELEASE_FEED_FORMATS.map((f) => (
+        <FeedUrlRow key={f.id} slug={slug} platform={platform} channel={channel} format={f} />
+      ))}
+    </div>
+  )
+}
+
+function FeedUrlsDialog({ products, onClose }: { products: Product[]; onClose: () => void }) {
+  const [productId, setProductId] = useState(products[0]?.id || "")
+  const [platform, setPlatform] = useState<string>(RELEASE_PLATFORMS[0])
+  const [channel, setChannel] = useState<string>(RELEASE_CHANNELS[0])
+  const product = products.find((p) => p.id === productId)
+
+  return (
+    <Dialog open onOpenChange={onClose}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Update feed URLs</DialogTitle>
+          <DialogDescription>
+            Public endpoints your installed clients poll for updates. They serve published, non-yanked releases only.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-4 py-2">
+          <div className="grid gap-3 sm:grid-cols-3">
+            <div className="space-y-2">
+              <Label>Product</Label>
+              <Select value={productId} onValueChange={setProductId}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {products.map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label>Platform</Label>
+              <Select value={platform} onValueChange={setPlatform}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {RELEASE_PLATFORMS.map((p) => (
+                    <SelectItem key={p} value={p}>
+                      {p}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label>Channel</Label>
+              <Select value={channel} onValueChange={setChannel}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {RELEASE_CHANNELS.map((c) => (
+                    <SelectItem key={c} value={c}>
+                      {c}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          {product ? (
+            <FeedLinks slug={product.slug} platform={platform} channel={channel} />
+          ) : (
+            <p className="text-sm text-muted-foreground">Select a product to see its feed URLs.</p>
+          )}
+
+          <p className="text-xs text-muted-foreground">
+            Feeds are unauthenticated on purpose — clients verify the artifact's Ed25519 signature, not the URL. Keep
+            genuinely private builds off these channels.
+          </p>
+        </div>
+
+        <div className="flex justify-end pt-2">
+          <Button variant="outline" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -638,6 +796,14 @@ function ReleaseDetailDialog({ release, onClose }: { release: Release; onClose: 
               <Plus className="h-4 w-4 mr-2" /> Add artifact ({remainingPlatforms.length} platforms remaining)
             </Button>
           )}
+
+          {rel.status === "published" && rel.product?.slug && artifacts.length > 0 && (
+            <ReleaseFeedSection
+              slug={rel.product.slug}
+              channel={rel.channel}
+              platforms={artifacts.map((a) => a.platform)}
+            />
+          )}
         </div>
 
         {adding && (
@@ -654,6 +820,43 @@ function ReleaseDetailDialog({ release, onClose }: { release: Release; onClose: 
         )}
       </DialogContent>
     </Dialog>
+  )
+}
+
+// Feed URLs for one published release: the channel is fixed (the
+// release's own), the platform is picked from the platforms this release
+// actually shipped — a feed URL for a platform without an artifact would
+// just serve older releases.
+function ReleaseFeedSection({ slug, channel, platforms }: { slug: string; channel: string; platforms: string[] }) {
+  const [platform, setPlatform] = useState(platforms[0])
+  const active = platforms.includes(platform) ? platform : platforms[0]
+
+  return (
+    <div className="border-t pt-4">
+      <div className="flex items-center justify-between gap-3 mb-2">
+        <div>
+          <p className="text-sm font-medium">Update feeds</p>
+          <p className="text-xs text-muted-foreground">
+            Public <span className="capitalize">{channel}</span>-channel endpoints serving this release.
+          </p>
+        </div>
+        {platforms.length > 1 && (
+          <Select value={active} onValueChange={setPlatform}>
+            <SelectTrigger className="w-44">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {platforms.map((p) => (
+                <SelectItem key={p} value={p}>
+                  {p}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+      </div>
+      <FeedLinks slug={slug} platform={active} channel={channel} />
+    </div>
   )
 }
 
