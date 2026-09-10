@@ -16,7 +16,7 @@ import {
   Upload,
   X,
 } from "lucide-react"
-import { type ChangeEvent, useEffect, useRef, useState } from "react"
+import { type ChangeEvent, useEffect, useMemo, useRef, useState } from "react"
 import { Link } from "react-router-dom"
 import { showToast } from "@/components/toast"
 import {
@@ -526,11 +526,48 @@ function FeedLinks({ slug, platform, channel }: { slug: string; platform: string
   )
 }
 
+// Which channel/platform combinations a product has actually published.
+// The pickers stay fully selectable on purpose — you often want the feed
+// URL in hand before the first build for that platform exists — but a
+// combination with nothing behind it gets called out, because the feed
+// answers it with an empty document (204 for Tauri), not an error. Without
+// the hint an admin pastes a perfectly valid URL, sees nothing come back,
+// and blames the server.
+function usePublishedCoverage(productId: string) {
+  const { data, isLoading } = useQuery({
+    // 200 is the backend's max page size. Coverage needs only one
+    // published release per combination, so a product with more releases
+    // than that still lights up every combination it actually ships.
+    queryKey: ["admin", "releases", "coverage", productId],
+    queryFn: () => admin.listReleases({ product_id: productId, status: "published", limit: 200 }),
+    enabled: !!productId,
+  })
+
+  const { channels, counts } = useMemo(() => {
+    // Yanked releases are excluded by the status filter, matching what
+    // the public feed serves.
+    const channels = new Set<string>()
+    const counts = new Map<string, number>()
+    for (const rel of data?.releases || []) {
+      channels.add(rel.channel)
+      for (const a of rel.artifacts || []) {
+        const key = `${rel.channel}|${a.platform}`
+        counts.set(key, (counts.get(key) || 0) + 1)
+      }
+    }
+    return { channels, counts }
+  }, [data])
+
+  return { channels, counts, isLoading }
+}
+
 function FeedUrlsDialog({ products, onClose }: { products: Product[]; onClose: () => void }) {
   const [productId, setProductId] = useState(products[0]?.id || "")
   const [platform, setPlatform] = useState<string>(RELEASE_PLATFORMS[0])
   const [channel, setChannel] = useState<string>(RELEASE_CHANNELS[0])
   const product = products.find((p) => p.id === productId)
+  const { channels, counts, isLoading } = usePublishedCoverage(productId)
+  const shipped = counts.get(`${channel}|${platform}`) || 0
 
   return (
     <Dialog open onOpenChange={onClose}>
@@ -567,7 +604,11 @@ function FeedUrlsDialog({ products, onClose }: { products: Product[]; onClose: (
                 </SelectTrigger>
                 <SelectContent>
                   {RELEASE_PLATFORMS.map((p) => (
-                    <SelectItem key={p} value={p}>
+                    <SelectItem
+                      key={p}
+                      value={p}
+                      className={counts.has(`${channel}|${p}`) ? "" : "text-muted-foreground"}
+                    >
                       {p}
                     </SelectItem>
                   ))}
@@ -582,7 +623,7 @@ function FeedUrlsDialog({ products, onClose }: { products: Product[]; onClose: (
                 </SelectTrigger>
                 <SelectContent>
                   {RELEASE_CHANNELS.map((c) => (
-                    <SelectItem key={c} value={c}>
+                    <SelectItem key={c} value={c} className={channels.has(c) ? "" : "text-muted-foreground"}>
                       {c}
                     </SelectItem>
                   ))}
@@ -592,7 +633,27 @@ function FeedUrlsDialog({ products, onClose }: { products: Product[]; onClose: (
           </div>
 
           {product ? (
-            <FeedLinks slug={product.slug} platform={platform} channel={channel} />
+            <div className="space-y-3">
+              <FeedLinks slug={product.slug} platform={platform} channel={channel} />
+              {!isLoading &&
+                (shipped > 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    {shipped} published {shipped === 1 ? "release" : "releases"} on this combination (Sparkle and
+                    Velopack list them, Tauri serves the newest).
+                  </p>
+                ) : (
+                  <p className="text-xs text-amber-600 dark:text-amber-500 flex items-start gap-1.5">
+                    <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-px" />
+                    <span>
+                      {channels.has(channel)
+                        ? `No published ${platform} artifact on the ${channel} channel yet.`
+                        : `Nothing published on the ${channel} channel yet.`}{" "}
+                      These URLs are valid and will start serving as soon as you publish one — until then clients get an
+                      empty feed.
+                    </span>
+                  </p>
+                ))}
+            </div>
           ) : (
             <p className="text-sm text-muted-foreground">Select a product to see its feed URLs.</p>
           )}
