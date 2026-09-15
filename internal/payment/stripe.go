@@ -502,16 +502,77 @@ func (h *StripeHandler) SyncRecentCheckouts(ctx context.Context) {
 	}
 }
 
-func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) {
-	var data struct {
-		Subscription string `json:"subscription"`
-		PeriodEnd    int64  `json:"period_end"`
+// webhookInvoice is the subset of a basil-era (2025-03-31+) Invoice
+// object the webhook handlers read. The top-level `subscription` field
+// was removed in 2025-03-31.basil; the subscription that generated an
+// invoice now lives at parent.subscription_details.subscription.
+// Parent is null for one-off (non-subscription) invoices.
+type webhookInvoice struct {
+	Parent *struct {
+		SubscriptionDetails *struct {
+			Subscription string `json:"subscription"`
+		} `json:"subscription_details"`
+	} `json:"parent"`
+	Lines struct {
+		Data []struct {
+			Period struct {
+				End int64 `json:"end"`
+			} `json:"period"`
+			Parent *struct {
+				SubscriptionItemDetails *struct {
+					Subscription string `json:"subscription"`
+				} `json:"subscription_item_details"`
+			} `json:"parent"`
+		} `json:"data"`
+	} `json:"lines"`
+	HostedInvoiceURL string `json:"hosted_invoice_url"`
+	AmountDue        int64  `json:"amount_due"`
+	Currency         string `json:"currency"`
+}
+
+// subscriptionID returns the ID of the subscription that generated the
+// invoice, or "" when the invoice has no subscription parent.
+func (inv *webhookInvoice) subscriptionID() string {
+	if inv.Parent == nil || inv.Parent.SubscriptionDetails == nil {
+		return ""
 	}
-	if json.Unmarshal(raw, &data) != nil || data.Subscription == "" {
+	return inv.Parent.SubscriptionDetails.Subscription
+}
+
+// subscriptionPeriodEnd returns the latest service-period end among the
+// invoice's subscription line items, or 0 when there are none.
+//
+// The invoice's own top-level period_end is NOT the renewal horizon: it
+// is the end of the window in which pending invoice items were
+// collected, which for a renewal invoice is the *start* of the new
+// billing cycle. The period actually being paid for is on each
+// subscription line (lines.data[].period), so that is what extends
+// valid_until. The max is taken because proration lines for a mid-cycle
+// change can carry earlier periods alongside the full-cycle line.
+func (inv *webhookInvoice) subscriptionPeriodEnd() int64 {
+	var end int64
+	for _, line := range inv.Lines.Data {
+		if line.Parent == nil || line.Parent.SubscriptionItemDetails == nil {
+			continue
+		}
+		if line.Period.End > end {
+			end = line.Period.End
+		}
+	}
+	return end
+}
+
+func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) {
+	var data webhookInvoice
+	if json.Unmarshal(raw, &data) != nil {
+		return
+	}
+	subID := data.subscriptionID()
+	if subID == "" {
 		return
 	}
 
-	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.Subscription)
+	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, subID)
 	if err != nil {
 		return
 	}
@@ -524,11 +585,20 @@ func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) 
 	if lic.PastDueAt != nil {
 		episode = lic.PastDueAt.Unix()
 	}
-	until := time.Unix(data.PeriodEnd, 0)
-	lic.ValidUntil = &until
+	cols := []string{"status", "past_due_at"}
+	// Never write valid_until from a missing period: a zero end would
+	// expire the license at the Unix epoch.
+	if periodEnd := data.subscriptionPeriodEnd(); periodEnd > 0 {
+		until := time.Unix(periodEnd, 0)
+		lic.ValidUntil = &until
+		cols = append(cols, "valid_until")
+	} else {
+		slog.Warn("stripe invoice.paid: no subscription line period, valid_until unchanged",
+			"subscription_id", subID, "license_id", lic.ID)
+	}
 	lic.Status = model.StatusActive
 	lic.PastDueAt = nil
-	_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, "valid_until", "status", "past_due_at")
+	_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, cols...)
 
 	// Recovery notification — shares the dedup path with
 	// onSubscriptionUpdated. Some flows emit invoice.paid without a
@@ -539,12 +609,35 @@ func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) 
 	}
 }
 
-func (h *StripeHandler) onSubscriptionUpdated(ctx context.Context, raw json.RawMessage) {
-	var data struct {
-		ID               string `json:"id"`
-		Status           string `json:"status"`
-		CurrentPeriodEnd int64  `json:"current_period_end"`
+// webhookSubscription is the subset of a basil-era Subscription object
+// the webhook handlers read. Since 2025-03-31.basil the billing period
+// is per item (items.data[].current_period_end); the top-level
+// current_period_end no longer exists.
+type webhookSubscription struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Items  struct {
+		Data []struct {
+			CurrentPeriodEnd int64 `json:"current_period_end"`
+		} `json:"data"`
+	} `json:"items"`
+}
+
+// currentPeriodEnd returns the latest current_period_end across the
+// subscription's items (items can bill on different cycles; access
+// lasts until the last one lapses), or 0 when there are no items.
+func (sub *webhookSubscription) currentPeriodEnd() int64 {
+	var end int64
+	for _, item := range sub.Items.Data {
+		if item.CurrentPeriodEnd > end {
+			end = item.CurrentPeriodEnd
+		}
 	}
+	return end
+}
+
+func (h *StripeHandler) onSubscriptionUpdated(ctx context.Context, raw json.RawMessage) {
+	var data webhookSubscription
 	if json.Unmarshal(raw, &data) != nil {
 		return
 	}
@@ -564,7 +657,7 @@ func (h *StripeHandler) onSubscriptionUpdated(ctx context.Context, raw json.RawM
 	if lic.PastDueAt != nil {
 		episode = lic.PastDueAt.Unix()
 	}
-	cols := []string{"status", "valid_until", "canceled_at", "past_due_at"}
+	cols := []string{"status", "canceled_at", "past_due_at"}
 
 	switch data.Status {
 	case "active":
@@ -593,8 +686,14 @@ func (h *StripeHandler) onSubscriptionUpdated(ctx context.Context, raw json.RawM
 		lic.PastDueAt = nil
 	}
 
-	until := time.Unix(data.CurrentPeriodEnd, 0)
-	lic.ValidUntil = &until
+	if periodEnd := data.currentPeriodEnd(); periodEnd > 0 {
+		until := time.Unix(periodEnd, 0)
+		lic.ValidUntil = &until
+		cols = append(cols, "valid_until")
+	} else {
+		slog.Warn("stripe customer.subscription.updated: no item period, valid_until unchanged",
+			"subscription_id", data.ID, "license_id", lic.ID)
+	}
 	_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, cols...)
 
 	// Recovery notification fires only on past_due → active. Routed
@@ -674,14 +773,12 @@ func (h *StripeHandler) onSubscriptionDeleted(ctx context.Context, raw json.RawM
 }
 
 func (h *StripeHandler) onPaymentFailed(ctx context.Context, raw json.RawMessage) {
-	var data struct {
-		Subscription string `json:"subscription"`
-	}
-	if json.Unmarshal(raw, &data) != nil || data.Subscription == "" {
+	var data webhookInvoice
+	if json.Unmarshal(raw, &data) != nil || data.subscriptionID() == "" {
 		return
 	}
 
-	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.Subscription)
+	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.subscriptionID())
 	if err != nil {
 		return
 	}
@@ -1094,14 +1191,11 @@ func (h *StripeHandler) ListInvoices(c *gin.Context) {
 }
 
 func (h *StripeHandler) onPaymentActionRequired(ctx context.Context, raw json.RawMessage) {
-	var data struct {
-		Subscription     string `json:"subscription"`
-		HostedInvoiceURL string `json:"hosted_invoice_url"`
-	}
-	if json.Unmarshal(raw, &data) != nil || data.Subscription == "" {
+	var data webhookInvoice
+	if json.Unmarshal(raw, &data) != nil || data.subscriptionID() == "" {
 		return
 	}
-	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.Subscription)
+	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.subscriptionID())
 	if err != nil {
 		return
 	}
@@ -1189,16 +1283,11 @@ func (h *StripeHandler) onTrialWillEnd(ctx context.Context, raw json.RawMessage)
 }
 
 func (h *StripeHandler) onInvoiceUpcoming(ctx context.Context, raw json.RawMessage) {
-	var data struct {
-		Customer     string `json:"customer"`
-		Subscription string `json:"subscription"`
-		AmountDue    int64  `json:"amount_due"`
-		Currency     string `json:"currency"`
-	}
-	if json.Unmarshal(raw, &data) != nil || data.Subscription == "" {
+	var data webhookInvoice
+	if json.Unmarshal(raw, &data) != nil || data.subscriptionID() == "" {
 		return
 	}
-	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.Subscription)
+	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.subscriptionID())
 	if err != nil {
 		return
 	}
