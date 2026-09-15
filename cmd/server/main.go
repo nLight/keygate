@@ -412,27 +412,7 @@ func main() {
 		c.Next()
 	})
 
-	r.Use(func(c *gin.Context) {
-		if origin := c.GetHeader("Origin"); origin != "" {
-			if cfg.IsProduction() && origin != cfg.BaseURL {
-				if c.Request.Method == "OPTIONS" {
-					c.AbortWithStatus(http.StatusForbidden)
-					return
-				}
-				c.Next()
-				return
-			}
-			c.Header("Access-Control-Allow-Origin", origin)
-			c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-			c.Header("Access-Control-Allow-Headers", "Authorization,Content-Type")
-			c.Header("Access-Control-Allow-Credentials", "true")
-			if c.Request.Method == "OPTIONS" {
-				c.AbortWithStatus(http.StatusNoContent)
-				return
-			}
-		}
-		c.Next()
-	})
+	r.Use(middleware.CORS(cfg.BaseURL, cfg.IsProduction()))
 
 	operationalAuth := middleware.BearerTokenAuth(cfg.MetricsToken)
 	r.GET("/metrics", operationalAuth, gin.WrapH(promhttp.Handler()))
@@ -595,10 +575,10 @@ func main() {
 	// the per-IP bucket 4× the regular API limit so a single host
 	// running multiple installed products doesn't trip the 60/min default.
 	feedRateLimit := max(cfg.RateLimitAPI*4, 240)
-	// Feeds are anonymous and read-only, so any origin may read them —
-	// e.g. a product site rendering its download page from /latest.
+	// Feeds are anonymous and read-only, so middleware.CORS opens them —
+	// preflights included — to any origin, e.g. a product site rendering
+	// its download page from /latest.
 	feedMW := []gin.HandlerFunc{
-		middleware.PublicCORS(),
 		middleware.RateLimitByIP(feedRateLimit, time.Minute),
 	}
 	v1.GET("/releases/:product_slug/feed.xml", append(feedMW, releasePublicH.FeedSparkle)...)
