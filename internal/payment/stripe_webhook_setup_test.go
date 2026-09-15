@@ -19,9 +19,14 @@ const testBaseURL = "https://keygate.example"
 
 // fakeStripe serves the webhook endpoint API. existing is the endpoint
 // returned for GET; createStatus != 200 makes creation fail.
+// invoicePaymentSubs maps a payment intent to the subscription whose
+// invoice it paid; onRequest, if set, runs before every request.
 type fakeStripe struct {
-	existing     map[string]any
-	createStatus int
+	existing           map[string]any
+	createStatus       int
+	invoicePaymentSubs map[string]string
+	invoicePaymentsErr int // HTTP status to fail invoice payment lists with
+	onRequest          func(*http.Request)
 
 	mu       sync.Mutex
 	created  []string // raw form bodies of create requests
@@ -33,7 +38,32 @@ func (f *fakeStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
+	if f.onRequest != nil {
+		f.onRequest(r)
+	}
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/invoice_payments":
+		if f.invoicePaymentsErr != 0 {
+			w.WriteHeader(f.invoicePaymentsErr)
+			_, _ = w.Write([]byte(`{"error":{"type":"api_error","message":"unavailable"}}`))
+			return
+		}
+		data := []any{}
+		if sub := f.invoicePaymentSubs[r.URL.Query().Get("payment[payment_intent]")]; sub != "" {
+			data = append(data, map[string]any{
+				"id": "inpay_" + sub, "object": "invoice_payment",
+				"invoice": map[string]any{
+					"id": "in_" + sub, "object": "invoice",
+					"parent": map[string]any{
+						"type":                 "subscription_details",
+						"subscription_details": map[string]any{"subscription": sub},
+					},
+				},
+			})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list", "url": "/v1/invoice_payments", "has_more": false, "data": data,
+		})
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/webhook_endpoints/"):
 		f.getCount++
 		_ = json.NewEncoder(w).Encode(f.existing)

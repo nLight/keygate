@@ -136,10 +136,13 @@ type Config struct {
 func Load() (*Config, error) {
 	_ = godotenv.Load()
 
+	rawBaseURL := envOr("BASE_URL", "http://localhost:9000")
 	cfg := &Config{
 		Port:        envOr("PORT", "9000"),
 		Environment: envOr("ENVIRONMENT", "development"),
-		BaseURL:     envOr("BASE_URL", "http://localhost:9000"),
+		// Callers append paths ("/checkout/success"); a trailing slash
+		// would produce "//" URLs the frontend router doesn't match.
+		BaseURL: strings.TrimRight(rawBaseURL, "/"),
 
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 
@@ -155,7 +158,9 @@ func Load() (*Config, error) {
 		StripeSecretKey:     os.Getenv("STRIPE_SECRET_KEY"),
 		StripeWebhookSecret: os.Getenv("STRIPE_WEBHOOK_SECRET"),
 	}
-	cfg.LicenseTokenIssuer = envOr("LICENSE_TOKEN_ISSUER", cfg.BaseURL)
+	// The issuer is embedded in signed license tokens and may be pinned by
+	// clients, so it keeps BASE_URL exactly as configured.
+	cfg.LicenseTokenIssuer = envOr("LICENSE_TOKEN_ISSUER", rawBaseURL)
 
 	var err error
 	if cfg.SetupEnabled, err = envBoolOr("SETUP_ENABLED", true); err != nil {

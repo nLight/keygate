@@ -560,13 +560,20 @@ func (s *Store) FindLicenseByStripeSubscription(ctx context.Context, subID strin
 	return l, s.DB.NewSelect().Model(l).Where("stripe_subscription_id = ?", subID).Scan(ctx)
 }
 
-func (s *Store) FindLicenseByStripeCustomer(ctx context.Context, customerID string) (*model.License, error) {
+func (s *Store) FindLicenseByStripePaymentIntent(ctx context.Context, paymentIntentID string) (*model.License, error) {
 	l := new(model.License)
-	return l, s.DB.NewSelect().Model(l).
-		Relation("Plan").Relation("Product").
+	return l, s.DB.NewSelect().Model(l).Where("stripe_payment_intent_id = ?", paymentIntentID).Scan(ctx)
+}
+
+// ListLicensesByStripeCustomer returns every license paid for by the
+// customer, newest first. A customer can hold several licenses.
+func (s *Store) ListLicensesByStripeCustomer(ctx context.Context, customerID string) ([]*model.License, error) {
+	var out []*model.License
+	err := s.DB.NewSelect().Model(&out).
 		Where("license.stripe_customer_id = ?", customerID).
-		OrderExpr("license.created_at DESC").Limit(1).
+		OrderExpr("license.created_at DESC").
 		Scan(ctx)
+	return out, err
 }
 
 func (s *Store) UpdateLicense(ctx context.Context, l *model.License, cols ...string) error {
@@ -616,25 +623,12 @@ func (s *Store) ListLicensesByEmail(ctx context.Context, email string) ([]*model
 	return out, err
 }
 
-// FindActiveLicenseByEmailAndProduct returns an active or trialing license
-// for the given email and product, or nil if none exists.
 func (s *Store) UpdateLicenseUser(ctx context.Context, licenseID, userID string) error {
 	_, err := s.DB.NewUpdate().Model((*model.License)(nil)).
 		Set("user_id = ?", userID).
 		Where("id = ?", licenseID).
 		Exec(ctx)
 	return err
-}
-
-func (s *Store) FindActiveLicenseByEmailAndProduct(ctx context.Context, email, productID string) *model.License {
-	var lic model.License
-	err := s.DB.NewSelect().Model(&lic).
-		Where("email = ? AND product_id = ? AND status IN (?, ?)", email, productID, "active", "trialing").
-		Limit(1).Scan(ctx)
-	if err != nil {
-		return nil
-	}
-	return &lic
 }
 
 // LicenseListFilter narrows ListLicenses queries. New filters slot
@@ -1088,6 +1082,17 @@ func (s *Store) TryRecordProcessedEvent(ctx context.Context, provider, eventID s
 	).Scan(ctx, &id)
 	// If id is empty, the insert was a no-op (already exists) → skip
 	return err == nil && id != ""
+}
+
+// ForgetProcessedEvent releases a claim taken by TryRecordProcessedEvent,
+// for work that failed and should be retried by a later delivery.
+func (s *Store) ForgetProcessedEvent(ctx context.Context, provider, eventID string) {
+	if _, err := s.DB.NewRaw(
+		"DELETE FROM processed_events WHERE provider = ? AND event_id = ?",
+		provider, eventID,
+	).Exec(ctx); err != nil {
+		slog.Error("forget processed event failed", "provider", provider, "event_id", eventID, "error", err)
+	}
 }
 
 // ─── Transactional Activation ───

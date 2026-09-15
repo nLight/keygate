@@ -291,6 +291,9 @@ type License struct {
 	PaymentProvider      string `json:"payment_provider,omitempty"`
 	StripeCustomerID     string `json:"stripe_customer_id,omitempty"`
 	StripeSubscriptionID string `bun:",unique,nullzero" json:"stripe_subscription_id,omitempty"`
+	// Set for one-time purchases, which have no subscription to trace
+	// refunds through.
+	StripePaymentIntentID string `bun:",unique,nullzero" json:"stripe_payment_intent_id,omitempty"`
 
 	Status      string     `bun:",notnull,default:'active'" json:"status"`
 	ValidFrom   time.Time  `bun:",notnull,default:now()" json:"valid_from"`
