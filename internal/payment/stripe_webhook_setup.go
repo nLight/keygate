@@ -55,10 +55,20 @@ func (h *StripeHandler) ensureWebhookEndpoint(ctx context.Context) error {
 	endpointID, _ := h.Store.GetSetting(ctx, settingWebhookEndpointID)
 	secret, _ := h.Store.GetSetting(ctx, settingWebhookSecret)
 
+	// staleEndpointID is an existing endpoint that must be replaced. Stripe
+	// only accepts api_version at creation, so an endpoint pinned to a
+	// different version (or none — which means the account default) has to
+	// be recreated; otherwise stripe-go rejects every event it delivers.
+	staleEndpointID := ""
 	if endpointID != "" && secret != "" {
 		// Verify the endpoint still exists in Stripe
 		ep, err := webhookendpoint.Get(endpointID, nil)
-		if err == nil && !ep.Deleted && ep.Status == "enabled" {
+		if err == nil && !ep.Deleted && ep.APIVersion != stripe.APIVersion {
+			slog.Warn("stripe webhook endpoint API version mismatch, recreating",
+				"endpoint_id", endpointID, "endpoint_api_version", ep.APIVersion,
+				"sdk_api_version", stripe.APIVersion)
+			staleEndpointID = endpointID
+		} else if err == nil && !ep.Deleted && ep.Status == "enabled" {
 			if ep.URL == webhookURL {
 				h.SetWebhookSecret(secret)
 				slog.Info("stripe webhook endpoint verified", "endpoint_id", endpointID)
@@ -76,13 +86,16 @@ func (h *StripeHandler) ensureWebhookEndpoint(ctx context.Context) error {
 			}
 			slog.Warn("stripe webhook endpoint update failed, will recreate", "error", err)
 		}
-		slog.Warn("stripe webhook endpoint not found or disabled, creating new", "old_endpoint_id", endpointID)
+		if staleEndpointID == "" {
+			slog.Warn("stripe webhook endpoint not found or disabled, creating new", "old_endpoint_id", endpointID)
+		}
 	}
 
 	// Create new webhook endpoint
 	ep, err := webhookendpoint.New(&stripe.WebhookEndpointParams{
 		URL:           stripe.String(webhookURL),
 		EnabledEvents: stripeWebhookEvents,
+		APIVersion:    stripe.String(stripe.APIVersion),
 		Description:   stripe.String("Keygate auto-managed webhook"),
 		Metadata:      map[string]string{"managed_by": "keygate"},
 	})
@@ -100,6 +113,14 @@ func (h *StripeHandler) ensureWebhookEndpoint(ctx context.Context) error {
 
 	h.SetWebhookSecret(ep.Secret)
 	slog.Info("stripe webhook endpoint created", "endpoint_id", ep.ID, "url", webhookURL)
+
+	// Delete the replaced endpoint only after the new one is saved, so a
+	// failure above never leaves us without a working endpoint.
+	if staleEndpointID != "" {
+		if _, err := webhookendpoint.Del(staleEndpointID, nil); err != nil {
+			slog.Warn("delete stale stripe webhook endpoint failed", "endpoint_id", staleEndpointID, "error", err)
+		}
+	}
 	return nil
 }
 
