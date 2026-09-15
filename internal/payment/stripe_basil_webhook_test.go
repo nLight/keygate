@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,9 +24,63 @@ import (
 
 const basilTestSecret = "whsec_basil_test"
 
-// setupBasilWebhookTest returns a handler wired to Postgres and a
-// subscription license keyed by a unique Stripe subscription ID.
-func setupBasilWebhookTest(t *testing.T, status string) (*StripeHandler, *store.Store, *model.License) {
+// fakeSubscriptionItems serves GET /v1/subscription_items for one
+// subscription, paginating pageSize items at a time.
+type fakeSubscriptionItems struct {
+	subID      string
+	periodEnds []int64
+	pageSize   int
+	status     int // non-200 fails every request
+
+	mu       sync.Mutex
+	requests int
+}
+
+func (f *fakeSubscriptionItems) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requests++
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet || r.URL.Path != "/v1/subscription_items" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if f.status != 0 && f.status != http.StatusOK {
+		w.WriteHeader(f.status)
+		_, _ = w.Write([]byte(`{"error":{"type":"api_error","message":"unavailable"}}`))
+		return
+	}
+	if got := r.URL.Query().Get("subscription"); got != f.subID {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"wrong subscription"}}`))
+		return
+	}
+	start := 0
+	if after := r.URL.Query().Get("starting_after"); after != "" {
+		_, _ = fmt.Sscanf(after, "si_%d", &start)
+		start++
+	}
+	size := f.pageSize
+	if size <= 0 {
+		size = len(f.periodEnds)
+	}
+	end := min(start+size, len(f.periodEnds))
+	data := []map[string]any{}
+	for i := start; i < end; i++ {
+		data = append(data, map[string]any{
+			"id": fmt.Sprintf("si_%d", i), "object": "subscription_item",
+			"subscription": f.subID, "current_period_end": f.periodEnds[i],
+		})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"object": "list", "url": "/v1/subscription_items", "data": data, "has_more": end < len(f.periodEnds),
+	})
+}
+
+// setupBasilWebhookTest returns a handler wired to Postgres, a
+// subscription license keyed by a unique Stripe subscription ID, and a
+// stubbed Stripe API whose subscription items end at renewalPeriodEnd.
+func setupBasilWebhookTest(t *testing.T, status string) (*StripeHandler, *store.Store, *model.License, *fakeSubscriptionItems) {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -72,9 +127,24 @@ func setupBasilWebhookTest(t *testing.T, status string) (*StripeHandler, *store.
 		t.Fatal(err)
 	}
 
+	fake := &fakeSubscriptionItems{subID: lic.StripeSubscriptionID, periodEnds: []int64{renewalPeriodEnd}}
+	srv := httptest.NewServer(fake)
+	t.Cleanup(srv.Close)
+	prevKey := stripe.Key
+	stripe.Key = "sk_test_fake"
+	stripe.SetBackend(stripe.APIBackend, stripe.GetBackendWithConfig(stripe.APIBackend, &stripe.BackendConfig{
+		URL:               stripe.String(srv.URL),
+		MaxNetworkRetries: stripe.Int64(0),
+		LeveledLogger:     &stripe.LeveledLogger{Level: stripe.LevelNull},
+	}))
+	t.Cleanup(func() {
+		stripe.Key = prevKey
+		stripe.SetBackend(stripe.APIBackend, nil)
+	})
+
 	h := &StripeHandler{Store: s}
 	h.SetWebhookSecret(basilTestSecret)
-	return h, s, lic
+	return h, s, lic, fake
 }
 
 // deliverEvent signs a basil event wrapping object and runs it through
@@ -133,7 +203,7 @@ func assertValidUntil(t *testing.T, lic *model.License, want int64) {
 }
 
 func TestBasilInvoicePaidRenewalExtendsValidUntil(t *testing.T) {
-	h, s, lic := setupBasilWebhookTest(t, model.StatusPastDue)
+	h, s, lic, _ := setupBasilWebhookTest(t, model.StatusPastDue)
 
 	deliverEvent(t, h, "invoice.paid", fixtureFor(t, "invoice_paid_renewal.json", lic))
 
@@ -144,19 +214,70 @@ func TestBasilInvoicePaidRenewalExtendsValidUntil(t *testing.T) {
 	assertValidUntil(t, got, renewalPeriodEnd)
 }
 
-func TestBasilInvoicePaidWithoutLinesKeepsValidUntil(t *testing.T) {
-	h, s, lic := setupBasilWebhookTest(t, model.StatusActive)
-
-	obj := fmt.Sprintf(`{"id":"in_nolines","object":"invoice","period_end":1,
+// invoiceWithLines builds a subscription invoice for lic whose embedded
+// line list is lines (each a JSON object) with the given has_more.
+func invoiceWithLines(lic *model.License, hasMore bool, lines ...string) []byte {
+	return []byte(fmt.Sprintf(`{"id":"in_test","object":"invoice","status":"paid","period_end":%d,
 		"parent":{"type":"subscription_details","subscription_details":{"subscription":%q}},
-		"lines":{"object":"list","data":[],"has_more":false}}`, lic.StripeSubscriptionID)
-	deliverEvent(t, h, "invoice.paid", []byte(obj))
+		"lines":{"object":"list","data":[%s],"has_more":%t}}`,
+		invoicePeriodEnd, lic.StripeSubscriptionID, strings.Join(lines, ","), hasMore))
+}
 
-	assertValidUntil(t, reloadLicense(t, s, lic), invoicePeriodEnd)
+func invoiceLine(lic *model.License, amount, start, end int64, proration bool) string {
+	return fmt.Sprintf(`{"object":"line_item","amount":%d,"period":{"start":%d,"end":%d},
+		"parent":{"type":"subscription_item_details","subscription_item_details":{"proration":%t,"subscription":%q,"subscription_item":"si_0"}}}`,
+		amount, start, end, proration, lic.StripeSubscriptionID)
+}
+
+// Annual → monthly with prorations: the invoice credits the unused
+// annual term (ending 2027-01-01) and charges the new month. The credit
+// period must not become the paid-through date.
+func TestBasilInvoicePaidIgnoresCreditProration(t *testing.T) {
+	h, s, lic, _ := setupBasilWebhookTest(t, model.StatusActive)
+
+	deliverEvent(t, h, "customer.subscription.updated", fixtureFor(t, "subscription_updated.json", lic))
+	assertValidUntil(t, reloadLicense(t, s, lic), renewalPeriodEnd)
+
+	const annualEnd = int64(1798761600) // 2027-01-01
+	deliverEvent(t, h, "invoice.paid", invoiceWithLines(lic, false,
+		invoiceLine(lic, -22000, invoicePeriodEnd, annualEnd, true),
+		invoiceLine(lic, 1900, invoicePeriodEnd, renewalPeriodEnd, false),
+	))
+
+	assertValidUntil(t, reloadLicense(t, s, lic), renewalPeriodEnd)
+}
+
+// The embedded line list is truncated to prorations that end at the
+// previous cycle boundary; the renewal line is on a later page.
+func TestBasilInvoicePaidTruncatedLinesKeepsRenewal(t *testing.T) {
+	h, s, lic, _ := setupBasilWebhookTest(t, model.StatusActive)
+
+	deliverEvent(t, h, "customer.subscription.updated", fixtureFor(t, "subscription_updated.json", lic))
+
+	lines := make([]string, 10)
+	for i := range lines {
+		lines[i] = invoiceLine(lic, 100, invoicePeriodEnd-86400, invoicePeriodEnd, true)
+	}
+	deliverEvent(t, h, "invoice.paid", invoiceWithLines(lic, true, lines...))
+
+	assertValidUntil(t, reloadLicense(t, s, lic), renewalPeriodEnd)
+}
+
+func TestBasilInvoicePaidStripeUnavailableKeepsValidUntil(t *testing.T) {
+	h, s, lic, fake := setupBasilWebhookTest(t, model.StatusPastDue)
+	fake.status = http.StatusInternalServerError
+
+	deliverEvent(t, h, "invoice.paid", fixtureFor(t, "invoice_paid_renewal.json", lic))
+
+	got := reloadLicense(t, s, lic)
+	if got.Status != model.StatusActive {
+		t.Fatalf("status=%q, want active", got.Status)
+	}
+	assertValidUntil(t, got, invoicePeriodEnd)
 }
 
 func TestBasilSubscriptionUpdatedUsesItemPeriod(t *testing.T) {
-	h, s, lic := setupBasilWebhookTest(t, model.StatusPastDue)
+	h, s, lic, fake := setupBasilWebhookTest(t, model.StatusPastDue)
 
 	deliverEvent(t, h, "customer.subscription.updated", fixtureFor(t, "subscription_updated.json", lic))
 
@@ -165,10 +286,29 @@ func TestBasilSubscriptionUpdatedUsesItemPeriod(t *testing.T) {
 		t.Fatalf("status=%q past_due_at=%v, want active with past_due_at cleared", got.Status, got.PastDueAt)
 	}
 	assertValidUntil(t, got, renewalPeriodEnd)
+	if fake.requests != 0 {
+		t.Fatalf("complete embedded items should not hit the API, got %d requests", fake.requests)
+	}
+}
+
+func TestBasilSubscriptionUpdatedTruncatedItemsPaginates(t *testing.T) {
+	h, s, lic, fake := setupBasilWebhookTest(t, model.StatusActive)
+	const laterEnd = int64(1798761600)
+	fake.periodEnds = []int64{renewalPeriodEnd, renewalPeriodEnd, laterEnd}
+	fake.pageSize = 2
+
+	obj := strings.Replace(string(fixtureFor(t, "subscription_updated.json", lic)),
+		`"has_more": false`, `"has_more": true`, 1)
+	deliverEvent(t, h, "customer.subscription.updated", []byte(obj))
+
+	assertValidUntil(t, reloadLicense(t, s, lic), laterEnd)
+	if fake.requests != 2 {
+		t.Fatalf("expected 2 paginated requests, got %d", fake.requests)
+	}
 }
 
 func TestBasilInvoicePaymentFailedMarksPastDue(t *testing.T) {
-	h, s, lic := setupBasilWebhookTest(t, model.StatusActive)
+	h, s, lic, _ := setupBasilWebhookTest(t, model.StatusActive)
 
 	obj := strings.Replace(string(fixtureFor(t, "invoice_paid_renewal.json", lic)),
 		`"status": "paid"`, `"status": "open"`, 1)
@@ -181,7 +321,7 @@ func TestBasilInvoicePaymentFailedMarksPastDue(t *testing.T) {
 }
 
 func TestBasilInvoiceUpcomingAndActionRequiredResolveLicense(t *testing.T) {
-	h, s, lic := setupBasilWebhookTest(t, model.StatusActive)
+	h, s, lic, _ := setupBasilWebhookTest(t, model.StatusActive)
 	obj := fixtureFor(t, "invoice_paid_renewal.json", lic)
 
 	deliverEvent(t, h, "invoice.upcoming", obj)

@@ -36,10 +36,6 @@ func TestWebhookInvoiceDecodesBasilShape(t *testing.T) {
 	if got := inv.subscriptionID(); got != renewalSubID {
 		t.Fatalf("subscriptionID = %q, want %q", got, renewalSubID)
 	}
-	if got := inv.subscriptionPeriodEnd(); got != renewalPeriodEnd {
-		t.Fatalf("subscriptionPeriodEnd = %d, want %d (the line period end, not invoice period_end %d)",
-			got, renewalPeriodEnd, invoicePeriodEnd)
-	}
 
 	// Cross-check against the SDK's own basil struct so the fixture and
 	// the handler paths can't drift from what stripe-go considers valid.
@@ -71,33 +67,14 @@ func TestWebhookInvoiceWithoutSubscriptionParent(t *testing.T) {
 	if got := inv.subscriptionID(); got != "" {
 		t.Fatalf("subscriptionID = %q, want empty for a one-off invoice", got)
 	}
-	if got := inv.subscriptionPeriodEnd(); got != 0 {
-		t.Fatalf("subscriptionPeriodEnd = %d, want 0 when no subscription lines", got)
-	}
 
 	// A pre-basil payload must not be silently accepted either.
 	inv = webhookInvoice{}
 	if err := json.Unmarshal([]byte(`{"subscription":"sub_legacy","period_end":1767225600}`), &inv); err != nil {
 		t.Fatal(err)
 	}
-	if inv.subscriptionID() != "" || inv.subscriptionPeriodEnd() != 0 {
+	if inv.subscriptionID() != "" {
 		t.Fatalf("legacy top-level fields must be ignored: %+v", inv)
-	}
-}
-
-func TestWebhookInvoicePeriodEndTakesLatestSubscriptionLine(t *testing.T) {
-	var inv webhookInvoice
-	raw := `{"parent":{"type":"subscription_details","subscription_details":{"subscription":"sub_1"}},
-		"lines":{"data":[
-			{"period":{"end":1768000000},"parent":{"type":"subscription_item_details","subscription_item_details":{"proration":true,"subscription":"sub_1"}}},
-			{"period":{"end":1769904000},"parent":{"type":"subscription_item_details","subscription_item_details":{"proration":false,"subscription":"sub_1"}}},
-			{"period":{"end":1799999999},"parent":{"type":"invoice_item_details","invoice_item_details":{"invoice_item":"ii_1"}}}
-		]}}`
-	if err := json.Unmarshal([]byte(raw), &inv); err != nil {
-		t.Fatal(err)
-	}
-	if got := inv.subscriptionPeriodEnd(); got != 1769904000 {
-		t.Fatalf("subscriptionPeriodEnd = %d, want 1769904000", got)
 	}
 }
 
@@ -113,6 +90,9 @@ func TestWebhookSubscriptionDecodesBasilShape(t *testing.T) {
 	}
 	if got := sub.currentPeriodEnd(); got != renewalPeriodEnd {
 		t.Fatalf("currentPeriodEnd = %d, want %d", got, renewalPeriodEnd)
+	}
+	if sub.Items.HasMore {
+		t.Fatal("fixture items list should be complete")
 	}
 
 	var sdk stripe.Subscription

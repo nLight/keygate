@@ -20,6 +20,7 @@ import (
 	stripeinvoice "github.com/stripe/stripe-go/v82/invoice"
 	stripeprice "github.com/stripe/stripe-go/v82/price"
 	"github.com/stripe/stripe-go/v82/subscription"
+	"github.com/stripe/stripe-go/v82/subscriptionitem"
 	"github.com/stripe/stripe-go/v82/webhook"
 
 	"github.com/tabloy/keygate/internal/license"
@@ -513,18 +514,6 @@ type webhookInvoice struct {
 			Subscription string `json:"subscription"`
 		} `json:"subscription_details"`
 	} `json:"parent"`
-	Lines struct {
-		Data []struct {
-			Period struct {
-				End int64 `json:"end"`
-			} `json:"period"`
-			Parent *struct {
-				SubscriptionItemDetails *struct {
-					Subscription string `json:"subscription"`
-				} `json:"subscription_item_details"`
-			} `json:"parent"`
-		} `json:"data"`
-	} `json:"lines"`
 	HostedInvoiceURL string `json:"hosted_invoice_url"`
 	AmountDue        int64  `json:"amount_due"`
 	Currency         string `json:"currency"`
@@ -539,27 +528,32 @@ func (inv *webhookInvoice) subscriptionID() string {
 	return inv.Parent.SubscriptionDetails.Subscription
 }
 
-// subscriptionPeriodEnd returns the latest service-period end among the
-// invoice's subscription line items, or 0 when there are none.
+// subscriptionPeriodEnd returns the latest current_period_end across all
+// of a subscription's items, fetched from Stripe. Items can bill on
+// different cycles; access lasts until the last one lapses.
 //
-// The invoice's own top-level period_end is NOT the renewal horizon: it
-// is the end of the window in which pending invoice items were
-// collected, which for a renewal invoice is the *start* of the new
-// billing cycle. The period actually being paid for is on each
-// subscription line (lines.data[].period), so that is what extends
-// valid_until. The max is taken because proration lines for a mid-cycle
-// change can carry earlier periods alongside the full-cycle line.
-func (inv *webhookInvoice) subscriptionPeriodEnd() int64 {
+// invoice.paid uses this instead of anything on the invoice itself:
+//   - the invoice's top-level period_end is the window in which pending
+//     items were collected, which for a renewal is the *start* of the
+//     new cycle;
+//   - line periods include credit prorations for unused time (e.g. the
+//     rest of an annual term after switching to monthly), which must
+//     not grant access;
+//   - the embedded lines list is only the first page, and prorations
+//     sort before the subscription line, so the renewal line may not
+//     be in the payload at all.
+//
+// The subscription's item periods have already advanced by the time
+// the cycle's invoice is paid, so they are the paid-through horizon.
+func (h *StripeHandler) subscriptionPeriodEnd(subID string) (int64, error) {
 	var end int64
-	for _, line := range inv.Lines.Data {
-		if line.Parent == nil || line.Parent.SubscriptionItemDetails == nil {
-			continue
-		}
-		if line.Period.End > end {
-			end = line.Period.End
+	iter := subscriptionitem.List(&stripe.SubscriptionItemListParams{Subscription: stripe.String(subID)})
+	for iter.Next() {
+		if pe := iter.SubscriptionItem().CurrentPeriodEnd; pe > end {
+			end = pe
 		}
 	}
-	return end
+	return end, iter.Err()
 }
 
 func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) {
@@ -587,14 +581,15 @@ func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) 
 	}
 	cols := []string{"status", "past_due_at"}
 	// Never write valid_until from a missing period: a zero end would
-	// expire the license at the Unix epoch.
-	if periodEnd := data.subscriptionPeriodEnd(); periodEnd > 0 {
+	// expire the license at the Unix epoch. customer.subscription.updated
+	// carries the same period, so a failed lookup here is recoverable.
+	if periodEnd, err := h.subscriptionPeriodEnd(subID); err == nil && periodEnd > 0 {
 		until := time.Unix(periodEnd, 0)
 		lic.ValidUntil = &until
 		cols = append(cols, "valid_until")
 	} else {
-		slog.Warn("stripe invoice.paid: no subscription line period, valid_until unchanged",
-			"subscription_id", subID, "license_id", lic.ID)
+		slog.Warn("stripe invoice.paid: subscription period unavailable, valid_until unchanged",
+			"subscription_id", subID, "license_id", lic.ID, "error", err)
 	}
 	lic.Status = model.StatusActive
 	lic.PastDueAt = nil
@@ -620,12 +615,14 @@ type webhookSubscription struct {
 		Data []struct {
 			CurrentPeriodEnd int64 `json:"current_period_end"`
 		} `json:"data"`
+		HasMore bool `json:"has_more"`
 	} `json:"items"`
 }
 
 // currentPeriodEnd returns the latest current_period_end across the
-// subscription's items (items can bill on different cycles; access
-// lasts until the last one lapses), or 0 when there are no items.
+// embedded items (items can bill on different cycles; access lasts
+// until the last one lapses), or 0 when there are no items. The result
+// is incomplete when Items.HasMore is set.
 func (sub *webhookSubscription) currentPeriodEnd() int64 {
 	var end int64
 	for _, item := range sub.Items.Data {
@@ -686,7 +683,16 @@ func (h *StripeHandler) onSubscriptionUpdated(ctx context.Context, raw json.RawM
 		lic.PastDueAt = nil
 	}
 
-	if periodEnd := data.currentPeriodEnd(); periodEnd > 0 {
+	periodEnd := data.currentPeriodEnd()
+	if data.Items.HasMore {
+		// The embedded items list is truncated; the latest period may be
+		// on a later page.
+		var err error
+		if periodEnd, err = h.subscriptionPeriodEnd(data.ID); err != nil {
+			periodEnd = 0
+		}
+	}
+	if periodEnd > 0 {
 		until := time.Unix(periodEnd, 0)
 		lic.ValidUntil = &until
 		cols = append(cols, "valid_until")
