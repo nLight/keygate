@@ -560,13 +560,15 @@ func (s *Store) FindLicenseByStripeSubscription(ctx context.Context, subID strin
 	return l, s.DB.NewSelect().Model(l).Where("stripe_subscription_id = ?", subID).Scan(ctx)
 }
 
-func (s *Store) FindLicenseByStripeCustomer(ctx context.Context, customerID string) (*model.License, error) {
-	l := new(model.License)
-	return l, s.DB.NewSelect().Model(l).
-		Relation("Plan").Relation("Product").
+// ListLicensesByStripeCustomer returns every license paid for by the
+// customer, newest first. A customer can hold several licenses.
+func (s *Store) ListLicensesByStripeCustomer(ctx context.Context, customerID string) ([]*model.License, error) {
+	var out []*model.License
+	err := s.DB.NewSelect().Model(&out).
 		Where("license.stripe_customer_id = ?", customerID).
-		OrderExpr("license.created_at DESC").Limit(1).
+		OrderExpr("license.created_at DESC").
 		Scan(ctx)
+	return out, err
 }
 
 func (s *Store) UpdateLicense(ctx context.Context, l *model.License, cols ...string) error {

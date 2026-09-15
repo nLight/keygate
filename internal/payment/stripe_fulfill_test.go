@@ -2,7 +2,10 @@ package payment
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,10 +18,15 @@ import (
 // knows no subscriptions or customers, so plans resolve from metadata.
 func setupFulfillTest(t *testing.T) (*StripeHandler, *store.Store, *model.Plan) {
 	t.Helper()
+	return setupFulfillTestWith(t, &fakeStripe{})
+}
+
+func setupFulfillTestWith(t *testing.T, fake *fakeStripe) (*StripeHandler, *store.Store, *model.Plan) {
+	t.Helper()
 	if os.Getenv("TEST_DATABASE_URL") == "" {
 		t.Skip("TEST_DATABASE_URL is not set")
 	}
-	h, s := setupWebhookTest(t, &fakeStripe{})
+	h, s := setupWebhookTest(t, fake)
 	s.LicenseKeyAEAD = keycrypto.MustDeriveAEAD(make([]byte, 32), "license-key")
 	ctx := context.Background()
 
@@ -111,5 +119,75 @@ func TestFulfillCheckoutReleasesClaimOnFailure(t *testing.T) {
 	h.fulfillCheckout(ctx, email, "", "", checkoutMeta(session, plan.ID), "sync")
 	if n := len(licensesFor(t, s, email, plan.ProductID)); n != 1 {
 		t.Fatalf("got %d licenses after retry, want 1", n)
+	}
+}
+
+// The request context is often why fulfillment failed (client disconnect),
+// so releasing the claim must not depend on it.
+func TestFulfillCheckoutReleasesClaimWhenContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Cancel once the claim is taken, while resolvePlan asks Stripe for
+	// the subscription.
+	fake := &fakeStripe{onRequest: func(r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/subscriptions/") {
+			cancel()
+		}
+	}}
+	h, s, plan := setupFulfillTestWith(t, fake)
+	email := "buyer-" + plan.Slug + "@example.com"
+	session := "cs_cancel_" + plan.Slug
+	sub := "sub_cancel_" + plan.Slug
+
+	h.fulfillCheckout(ctx, email, "", sub, checkoutMeta(session, plan.ID), "verify")
+	if n := len(licensesFor(t, s, email, plan.ProductID)); n != 0 {
+		t.Fatalf("got %d licenses with canceled context, want 0", n)
+	}
+
+	h.fulfillCheckout(context.Background(), email, "", sub, checkoutMeta(session, plan.ID), "sync")
+	if n := len(licensesFor(t, s, email, plan.ProductID)); n != 1 {
+		t.Fatalf("got %d licenses after retry, want 1", n)
+	}
+}
+
+// Two purchases by the same Stripe customer: refunding the older one must
+// revoke its license, not the customer's newest.
+func TestChargeRefundRevokesPurchasedLicense(t *testing.T) {
+	fake := &fakeStripe{}
+	h, s, plan := setupFulfillTestWith(t, fake)
+	ctx := context.Background()
+	email := "buyer-" + plan.Slug + "@example.com"
+	customer := "cus_shared_" + plan.Slug
+	subOld, subNew := "sub_old_"+plan.Slug, "sub_new_"+plan.Slug
+	fake.invoicePaymentSubs = map[string]string{"pi_old": subOld, "pi_new": subNew}
+
+	h.fulfillCheckout(ctx, email, customer, subOld, checkoutMeta("cs_old_"+plan.Slug, plan.ID), "webhook")
+	h.fulfillCheckout(ctx, email, customer, subNew, checkoutMeta("cs_new_"+plan.Slug, plan.ID), "webhook")
+
+	refund := func(pi string) {
+		raw, _ := json.Marshal(map[string]any{
+			"id": "ch_" + pi, "customer": customer, "payment_intent": pi,
+			"amount": 1299, "amount_refunded": 1299, "refunded": true,
+		})
+		h.onChargeRefunded(ctx, raw)
+	}
+	statuses := func() map[string]string {
+		out := map[string]string{}
+		for _, l := range licensesFor(t, s, email, plan.ProductID) {
+			out[l.StripeSubscriptionID] = l.Status
+		}
+		return out
+	}
+
+	refund("pi_old")
+	if got := statuses(); got[subOld] != model.StatusRevoked || got[subNew] != model.StatusActive {
+		t.Fatalf("after refunding the older purchase: %v", got)
+	}
+
+	// Without a subscription to trace, a customer with several licenses is
+	// ambiguous: nothing is revoked.
+	refund("pi_unknown")
+	if got := statuses(); got[subNew] != model.StatusActive {
+		t.Fatalf("ambiguous refund changed licenses: %v", got)
 	}
 }
