@@ -748,6 +748,60 @@ paths:
         "404":
           description: Unknown product_slug
 
+  /releases/{product_slug}/latest:
+    get:
+      tags: [Releases]
+      summary: Latest release metadata for download pages
+      description: |
+        Newest published build for one platform, for rendering a public
+        download page. CORS-open to any origin. `download_url` is the
+        stable `/latest/download` link, not a presigned URL.
+      parameters:
+        - $ref: "#/components/parameters/ProductSlug"
+        - $ref: "#/components/parameters/Platform"
+        - $ref: "#/components/parameters/Channel"
+      responses:
+        "200":
+          description: Latest release
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: string }
+                  channel: { type: string }
+                  platform: { type: string }
+                  name: { type: string }
+                  notes: { type: string }
+                  published_at: { type: string, format: date-time }
+                  filename: { type: string }
+                  size: { type: integer, format: int64 }
+                  sha256: { type: string }
+                  download_url: { type: string, format: uri }
+        "400":
+          description: Invalid platform / channel
+        "404":
+          description: Unknown product_slug, or nothing published for this platform/channel
+
+  /releases/{product_slug}/latest/download:
+    get:
+      tags: [Releases]
+      summary: Permanent download link for the latest build
+      description: |
+        Redirects to a freshly presigned storage URL, so the link itself
+        never expires. Safe to put behind a "Download" button.
+      parameters:
+        - $ref: "#/components/parameters/ProductSlug"
+        - $ref: "#/components/parameters/Platform"
+        - $ref: "#/components/parameters/Channel"
+      responses:
+        "302":
+          description: Redirect to the presigned artifact URL
+        "400":
+          description: Invalid platform / channel
+        "404":
+          description: Unknown product_slug, or nothing published for this platform/channel
+
   /releases/{product_slug}/upgrade.json:
     get:
       tags: [Releases]

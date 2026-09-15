@@ -137,6 +137,8 @@ jobs:
           tags: keygate:ci
       - uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
         with:
+          # The action's default Trivy (v0.65.0) release assets are gone.
+          version: v0.74.0
           image-ref: keygate:ci
           severity: CRITICAL,HIGH
           exit-code: "1"
@@ -144,6 +146,8 @@ jobs:
       - name: Container license policy
         uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
         with:
+          # The action's default Trivy (v0.65.0) release assets are gone.
+          version: v0.74.0
           image-ref: keygate:ci
           scanners: license
           severity: CRITICAL
