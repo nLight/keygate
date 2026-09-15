@@ -616,25 +616,12 @@ func (s *Store) ListLicensesByEmail(ctx context.Context, email string) ([]*model
 	return out, err
 }
 
-// FindActiveLicenseByEmailAndProduct returns an active or trialing license
-// for the given email and product, or nil if none exists.
 func (s *Store) UpdateLicenseUser(ctx context.Context, licenseID, userID string) error {
 	_, err := s.DB.NewUpdate().Model((*model.License)(nil)).
 		Set("user_id = ?", userID).
 		Where("id = ?", licenseID).
 		Exec(ctx)
 	return err
-}
-
-func (s *Store) FindActiveLicenseByEmailAndProduct(ctx context.Context, email, productID string) *model.License {
-	var lic model.License
-	err := s.DB.NewSelect().Model(&lic).
-		Where("email = ? AND product_id = ? AND status IN (?, ?)", email, productID, "active", "trialing").
-		Limit(1).Scan(ctx)
-	if err != nil {
-		return nil
-	}
-	return &lic
 }
 
 // LicenseListFilter narrows ListLicenses queries. New filters slot
@@ -1088,6 +1075,17 @@ func (s *Store) TryRecordProcessedEvent(ctx context.Context, provider, eventID s
 	).Scan(ctx, &id)
 	// If id is empty, the insert was a no-op (already exists) → skip
 	return err == nil && id != ""
+}
+
+// ForgetProcessedEvent releases a claim taken by TryRecordProcessedEvent,
+// for work that failed and should be retried by a later delivery.
+func (s *Store) ForgetProcessedEvent(ctx context.Context, provider, eventID string) {
+	if _, err := s.DB.NewRaw(
+		"DELETE FROM processed_events WHERE provider = ? AND event_id = ?",
+		provider, eventID,
+	).Exec(ctx); err != nil {
+		slog.Error("forget processed event failed", "provider", provider, "event_id", eventID, "error", err)
+	}
 }
 
 // ─── Transactional Activation ───

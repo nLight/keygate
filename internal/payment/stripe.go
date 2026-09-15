@@ -305,22 +305,50 @@ func (h *StripeHandler) onCheckoutCompleted(ctx context.Context, raw json.RawMes
 }
 
 // fulfillCheckout creates a license for a completed checkout session.
-// Idempotent: skips if an active license already exists for this email+product.
 // Called by webhook, success page verification, and periodic sync.
+//
+// Every paid checkout session yields its own license, so one buyer can
+// purchase several licenses for the same product (e.g. one per employee).
+// Idempotency is keyed on the session ID, which all callers set: the claim
+// is recorded before any work so concurrent callers can't both fulfill, and
+// released on any failure before the license exists so a later caller can
+// retry instead of the purchase being silently dropped.
 func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, subscriptionID string, metadata map[string]string, source string) {
-	// Idempotency: use Stripe session ID if available to prevent duplicate processing
-	if metadata != nil && metadata["session_id"] != "" {
-		if !h.Store.TryRecordProcessedEvent(ctx, "stripe_fulfill", metadata["session_id"]) {
+	sessionID := metadata["session_id"]
+	if sessionID == "" {
+		slog.Error("stripe checkout: missing session id, skipping", "subscription_id", subscriptionID, "source", source)
+		return
+	}
+	if !h.Store.TryRecordProcessedEvent(ctx, "stripe_fulfill", sessionID) {
+		return
+	}
+	keepClaim := false
+	defer func() {
+		if !keepClaim {
+			h.Store.ForgetProcessedEvent(ctx, "stripe_fulfill", sessionID)
+		}
+	}()
+
+	// A subscription backs exactly one license. This also covers sessions
+	// fulfilled before the session-ID claim existed.
+	if subscriptionID != "" {
+		if existing, err := h.Store.FindLicenseByStripeSubscription(ctx, subscriptionID); err == nil {
+			slog.Info("stripe checkout: subscription already has a license",
+				"subscription_id", subscriptionID, "existing_license", existing.ID, "source", source)
+			keepClaim = true // nothing left to do
 			return
 		}
 	}
+
 	var plan *model.Plan
 
 	if subscriptionID != "" {
 		plan = h.resolvePlan(ctx, subscriptionID)
 	}
-	if plan == nil && metadata != nil && metadata["plan_id"] != "" {
-		plan, _ = h.Store.FindPlanByID(ctx, metadata["plan_id"])
+	if plan == nil && metadata["plan_id"] != "" {
+		if p, err := h.Store.FindPlanByID(ctx, metadata["plan_id"]); err == nil {
+			plan = p
+		}
 	}
 	if plan == nil {
 		slog.Warn("stripe checkout: could not resolve plan", "subscription_id", subscriptionID, "metadata", metadata, "source", source)
@@ -337,15 +365,6 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 	if email == "" {
 		slog.Warn("stripe checkout: no customer email, skipping", "customer_id", customerID, "source", source)
 		return
-	}
-
-	// Prevent duplicate
-	{
-		if existing := h.Store.FindActiveLicenseByEmailAndProduct(ctx, email, plan.ProductID); existing != nil {
-			slog.Info("stripe checkout: license already exists",
-				"email", email, "product_id", plan.ProductID, "existing_license", existing.ID, "source", source)
-			return
-		}
 	}
 
 	status := model.StatusActive
@@ -379,6 +398,7 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 		slog.Error("stripe checkout: failed to create license", "email", email, "error", err)
 		return
 	}
+	keepClaim = true
 
 	// Link license to user
 	if u, err := h.Store.FindUserByEmail(ctx, email); err == nil {

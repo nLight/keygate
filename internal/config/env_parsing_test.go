@@ -171,3 +171,23 @@ func TestProductionFatalsCoverEveryNewSecret(t *testing.T) {
 		})
 	}
 }
+
+// Paths are appended to BaseURL, so a trailing slash must not leak into it.
+// The token issuer keeps the configured value: already-issued tokens carry
+// it and clients may pin it.
+func TestLoadTrimsBaseURLTrailingSlash(t *testing.T) {
+	setMinimumEnv(t)
+	t.Setenv("BASE_URL", "https://license.example.com/")
+	t.Setenv("LICENSE_TOKEN_ISSUER", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.BaseURL != "https://license.example.com" {
+		t.Fatalf("BaseURL = %q, want no trailing slash", cfg.BaseURL)
+	}
+	if cfg.LicenseTokenIssuer != "https://license.example.com/" {
+		t.Fatalf("LicenseTokenIssuer = %q, want BASE_URL unchanged", cfg.LicenseTokenIssuer)
+	}
+}
