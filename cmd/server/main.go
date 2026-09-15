@@ -595,12 +595,17 @@ func main() {
 	// the per-IP bucket 4× the regular API limit so a single host
 	// running multiple installed products doesn't trip the 60/min default.
 	feedRateLimit := max(cfg.RateLimitAPI*4, 240)
+	// Feeds are anonymous and read-only, so any origin may read them —
+	// e.g. a product site rendering its download page from /latest.
 	feedMW := []gin.HandlerFunc{
+		middleware.PublicCORS(),
 		middleware.RateLimitByIP(feedRateLimit, time.Minute),
 	}
 	v1.GET("/releases/:product_slug/feed.xml", append(feedMW, releasePublicH.FeedSparkle)...)
 	v1.GET("/releases/:product_slug/feed.json", append(feedMW, releasePublicH.FeedVelopack)...)
 	v1.GET("/releases/:product_slug/upgrade.json", append(feedMW, releasePublicH.FeedTauri)...)
+	v1.GET("/releases/:product_slug/latest", append(feedMW, releasePublicH.Latest)...)
+	v1.GET("/releases/:product_slug/latest/download", append(feedMW, releasePublicH.LatestDownload)...)
 
 	// Old /releases/feed.* (no product slug, license-key auth) → 410 Gone
 	// with a migration hint. Pre-launch hard cutover; no live clients.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +25,8 @@ import (
 //	GET  /api/v1/releases/:product_slug/feed.xml               Sparkle appcast (per-platform)
 //	GET  /api/v1/releases/:product_slug/feed.json              Velopack feed (per-platform)
 //	GET  /api/v1/releases/:product_slug/upgrade.json           Tauri manifest (single latest)
+//	GET  /api/v1/releases/:product_slug/latest                 latest release metadata for download pages
+//	GET  /api/v1/releases/:product_slug/latest/download        302 to a fresh presigned URL of the latest build
 //
 // Auth model: feeds are PUBLIC for every channel — stable, beta,
 // alpha, dev. Industry convention (Sparkle / Tauri / npm / GitHub
@@ -316,6 +319,87 @@ func (h *ReleasePublicHandler) FeedTauri(c *gin.Context) {
 	}
 	h.writeFeedCacheHeaders(c, req.channel)
 	c.JSON(http.StatusOK, manifest)
+}
+
+// LatestRelease is the download-page view of the newest published build
+// for one platform. DownloadURL is the stable /latest/download link, not
+// a presigned URL, so pages can cache or embed it without it expiring.
+type LatestRelease struct {
+	Version     string `json:"version"`
+	Channel     string `json:"channel"`
+	Platform    string `json:"platform"`
+	Name        string `json:"name,omitempty"`
+	Notes       string `json:"notes"`
+	PublishedAt string `json:"published_at,omitempty"`
+	Filename    string `json:"filename"`
+	Size        int64  `json:"size"`
+	SHA256      string `json:"sha256"`
+	DownloadURL string `json:"download_url"`
+}
+
+// The download link keeps the requested channel rather than rel.Channel:
+// with channel fallback a beta page may currently resolve to a stable
+// build, and its link should follow beta once one ships.
+func buildLatestRelease(baseURL, productSlug, channel string, rel *model.Release, a *model.ReleaseArtifact) LatestRelease {
+	q := url.Values{}
+	q.Set("platform", a.Platform)
+	q.Set("channel", channel)
+	out := LatestRelease{
+		Version:  rel.Version,
+		Channel:  rel.Channel,
+		Platform: a.Platform,
+		Name:     rel.Name,
+		Notes:    rel.ReleaseNotes,
+		Filename: service.DownloadFilename(rel, a),
+		Size:     a.FileSize,
+		SHA256:   strings.ToLower(a.SHA256),
+		DownloadURL: strings.TrimRight(baseURL, "/") + "/api/v1/releases/" +
+			url.PathEscape(productSlug) + "/latest/download?" + q.Encode(),
+	}
+	if rel.PublishedAt != nil {
+		out.PublishedAt = rel.PublishedAt.UTC().Format(time.RFC3339)
+	}
+	return out
+}
+
+// latestFeedRelease resolves the newest downloadable release for the
+// request. ok=false means the response has already been written.
+func (h *ReleasePublicHandler) latestFeedRelease(c *gin.Context) (feedRequest, *service.FeedRelease, bool) {
+	req, ok := h.parseFeedRequest(c)
+	if !ok {
+		return req, nil, false
+	}
+	req.limit = 1
+	feedReleases, ok := h.fetchPublishedFeedReleases(c, req)
+	if !ok {
+		return req, nil, false
+	}
+	if len(feedReleases) == 0 {
+		response.NotFound(c, "no published release for this platform and channel")
+		return req, nil, false
+	}
+	return req, feedReleases[0], true
+}
+
+// GET /api/v1/releases/:product_slug/latest — metadata for download pages
+func (h *ReleasePublicHandler) Latest(c *gin.Context) {
+	req, fr, ok := h.latestFeedRelease(c)
+	if !ok {
+		return
+	}
+	h.writeFeedCacheHeaders(c, req.channel)
+	c.JSON(http.StatusOK, buildLatestRelease(h.baseURL, req.product.Slug, req.channel, fr.Release, fr.Artifact))
+}
+
+// GET /api/v1/releases/:product_slug/latest/download — permanent download
+// link. Presigned URLs expire, so this redirects to a fresh one per click.
+func (h *ReleasePublicHandler) LatestDownload(c *gin.Context) {
+	_, fr, ok := h.latestFeedRelease(c)
+	if !ok {
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.Redirect(http.StatusFound, fr.DownloadURL)
 }
 
 // writeFeedCacheHeaders sets Cache-Control. All channels are public —
