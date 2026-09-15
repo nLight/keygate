@@ -303,7 +303,7 @@ func (h *StripeHandler) onCheckoutCompleted(ctx context.Context, raw json.RawMes
 		data.Metadata = map[string]string{}
 	}
 	data.Metadata["session_id"] = data.ID
-	h.fulfillCheckout(ctx, data.CustomerEmail, data.Customer, data.Subscription, data.Metadata, "webhook")
+	h.fulfillCheckout(ctx, data.CustomerEmail, data.Customer, data.Subscription, data.PaymentIntent, data.Metadata, "webhook")
 }
 
 // fulfillCheckout creates a license for a completed checkout session.
@@ -315,7 +315,7 @@ func (h *StripeHandler) onCheckoutCompleted(ctx context.Context, raw json.RawMes
 // is recorded before any work so concurrent callers can't both fulfill, and
 // released on any failure before the license exists so a later caller can
 // retry instead of the purchase being silently dropped.
-func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, subscriptionID string, metadata map[string]string, source string) {
+func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, subscriptionID, paymentIntentID string, metadata map[string]string, source string) {
 	sessionID := metadata["session_id"]
 	if sessionID == "" {
 		slog.Error("stripe checkout: missing session id, skipping", "subscription_id", subscriptionID, "source", source)
@@ -335,12 +335,19 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 		}
 	}()
 
-	// A subscription backs exactly one license. This also covers sessions
-	// fulfilled before the session-ID claim existed.
+	// A subscription or one-time payment backs exactly one license. This
+	// also covers sessions fulfilled before the session-ID claim existed.
 	if subscriptionID != "" {
 		if existing, err := h.Store.FindLicenseByStripeSubscription(ctx, subscriptionID); err == nil {
 			slog.Info("stripe checkout: subscription already has a license",
 				"subscription_id", subscriptionID, "existing_license", existing.ID, "source", source)
+			keepClaim = true // nothing left to do
+			return
+		}
+	} else if paymentIntentID != "" {
+		if existing, err := h.Store.FindLicenseByStripePaymentIntent(ctx, paymentIntentID); err == nil {
+			slog.Info("stripe checkout: payment already has a license",
+				"payment_intent", paymentIntentID, "existing_license", existing.ID, "source", source)
 			keepClaim = true // nothing left to do
 			return
 		}
@@ -395,6 +402,8 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 
 	if subscriptionID != "" {
 		lic.StripeSubscriptionID = subscriptionID
+	} else {
+		lic.StripePaymentIntentID = paymentIntentID
 	}
 
 	// Ensure user record exists so they appear in Customers
@@ -442,6 +451,15 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 	slog.Info("license created", "email", email, "plan", plan.Name, "source", source)
 }
 
+// checkoutPaymentIntentID returns the session's payment intent ID, set for
+// payment-mode (one-time) checkouts.
+func checkoutPaymentIntentID(sess *stripe.CheckoutSession) string {
+	if sess.PaymentIntent == nil {
+		return ""
+	}
+	return sess.PaymentIntent.ID
+}
+
 // VerifyCheckoutSession handles GET /api/v1/checkout/verify?session_id=xxx
 // Called by the success page to verify payment and create license (webhook fallback).
 func (h *StripeHandler) VerifyCheckoutSession(c *gin.Context) {
@@ -482,6 +500,7 @@ func (h *StripeHandler) VerifyCheckoutSession(c *gin.Context) {
 		sess.CustomerEmail,
 		custID,
 		subID,
+		checkoutPaymentIntentID(sess),
 		meta,
 		"verify",
 	)
@@ -521,7 +540,7 @@ func (h *StripeHandler) SyncRecentCheckouts(ctx context.Context) {
 			meta = map[string]string{}
 		}
 		meta["session_id"] = sess.ID
-		h.fulfillCheckout(ctx, sess.CustomerEmail, custID, subID, meta, "sync")
+		h.fulfillCheckout(ctx, sess.CustomerEmail, custID, subID, checkoutPaymentIntentID(sess), meta, "sync")
 	}
 	if err := iter.Err(); err != nil {
 		slog.Error("stripe sync: failed to list sessions", "error", err)
@@ -871,11 +890,16 @@ func (h *StripeHandler) onChargeRefunded(ctx context.Context, raw json.RawMessag
 
 // licenseForCharge resolves the license a charge paid for. A customer can
 // hold several licenses (one per purchase), so the customer alone doesn't
-// identify it: subscription charges are traced through their invoice to
-// the subscription, which backs exactly one license. Charges without a
-// subscription fall back to the customer only when that is unambiguous.
+// identify it: one-time purchases store their payment intent, and
+// subscription charges are traced through their invoice to the
+// subscription, which backs exactly one license. Licenses bought before
+// payment intents were stored fall back to the customer, only when that
+// is unambiguous.
 func (h *StripeHandler) licenseForCharge(ctx context.Context, chargeID, customerID, paymentIntentID string) *model.License {
 	if paymentIntentID != "" {
+		if lic, err := h.Store.FindLicenseByStripePaymentIntent(ctx, paymentIntentID); err == nil {
+			return lic
+		}
 		if subID := h.subscriptionForPaymentIntent(paymentIntentID); subID != "" {
 			lic, err := h.Store.FindLicenseByStripeSubscription(ctx, subID)
 			if err != nil {

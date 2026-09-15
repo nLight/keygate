@@ -71,11 +71,11 @@ func TestFulfillCheckoutCreatesLicensePerSession(t *testing.T) {
 	ctx := context.Background()
 	email := "buyer-" + plan.Slug + "@example.com"
 
-	h.fulfillCheckout(ctx, email, "", "sub_a_"+plan.Slug, checkoutMeta("cs_a_"+plan.Slug, plan.ID), "webhook")
-	h.fulfillCheckout(ctx, email, "", "sub_b_"+plan.Slug, checkoutMeta("cs_b_"+plan.Slug, plan.ID), "webhook")
+	h.fulfillCheckout(ctx, email, "", "sub_a_"+plan.Slug, "", checkoutMeta("cs_a_"+plan.Slug, plan.ID), "webhook")
+	h.fulfillCheckout(ctx, email, "", "sub_b_"+plan.Slug, "", checkoutMeta("cs_b_"+plan.Slug, plan.ID), "webhook")
 	// Webhook, success page and sync all see the same sessions.
-	h.fulfillCheckout(ctx, email, "", "sub_a_"+plan.Slug, checkoutMeta("cs_a_"+plan.Slug, plan.ID), "verify")
-	h.fulfillCheckout(ctx, email, "", "sub_b_"+plan.Slug, checkoutMeta("cs_b_"+plan.Slug, plan.ID), "sync")
+	h.fulfillCheckout(ctx, email, "", "sub_a_"+plan.Slug, "", checkoutMeta("cs_a_"+plan.Slug, plan.ID), "verify")
+	h.fulfillCheckout(ctx, email, "", "sub_b_"+plan.Slug, "", checkoutMeta("cs_b_"+plan.Slug, plan.ID), "sync")
 
 	lics := licensesFor(t, s, email, plan.ProductID)
 	if len(lics) != 2 {
@@ -94,8 +94,8 @@ func TestFulfillCheckoutSkipsSubscriptionWithLicense(t *testing.T) {
 	email := "buyer-" + plan.Slug + "@example.com"
 	sub := "sub_existing_" + plan.Slug
 
-	h.fulfillCheckout(ctx, email, "", sub, checkoutMeta("cs_first_"+plan.Slug, plan.ID), "webhook")
-	h.fulfillCheckout(ctx, email, "", sub, checkoutMeta("cs_other_"+plan.Slug, plan.ID), "sync")
+	h.fulfillCheckout(ctx, email, "", sub, "", checkoutMeta("cs_first_"+plan.Slug, plan.ID), "webhook")
+	h.fulfillCheckout(ctx, email, "", sub, "", checkoutMeta("cs_other_"+plan.Slug, plan.ID), "sync")
 
 	if n := len(licensesFor(t, s, email, plan.ProductID)); n != 1 {
 		t.Fatalf("got %d licenses, want 1", n)
@@ -111,12 +111,12 @@ func TestFulfillCheckoutReleasesClaimOnFailure(t *testing.T) {
 	session := "cs_retry_" + plan.Slug
 
 	// Unknown plan: nothing can be created.
-	h.fulfillCheckout(ctx, email, "", "", checkoutMeta(session, "00000000-0000-0000-0000-000000000000"), "webhook")
+	h.fulfillCheckout(ctx, email, "", "", "", checkoutMeta(session, "00000000-0000-0000-0000-000000000000"), "webhook")
 	if n := len(licensesFor(t, s, email, plan.ProductID)); n != 0 {
 		t.Fatalf("got %d licenses after failed fulfillment, want 0", n)
 	}
 
-	h.fulfillCheckout(ctx, email, "", "", checkoutMeta(session, plan.ID), "sync")
+	h.fulfillCheckout(ctx, email, "", "", "", checkoutMeta(session, plan.ID), "sync")
 	if n := len(licensesFor(t, s, email, plan.ProductID)); n != 1 {
 		t.Fatalf("got %d licenses after retry, want 1", n)
 	}
@@ -139,12 +139,12 @@ func TestFulfillCheckoutReleasesClaimWhenContextCanceled(t *testing.T) {
 	session := "cs_cancel_" + plan.Slug
 	sub := "sub_cancel_" + plan.Slug
 
-	h.fulfillCheckout(ctx, email, "", sub, checkoutMeta(session, plan.ID), "verify")
+	h.fulfillCheckout(ctx, email, "", sub, "", checkoutMeta(session, plan.ID), "verify")
 	if n := len(licensesFor(t, s, email, plan.ProductID)); n != 0 {
 		t.Fatalf("got %d licenses with canceled context, want 0", n)
 	}
 
-	h.fulfillCheckout(context.Background(), email, "", sub, checkoutMeta(session, plan.ID), "sync")
+	h.fulfillCheckout(context.Background(), email, "", sub, "", checkoutMeta(session, plan.ID), "sync")
 	if n := len(licensesFor(t, s, email, plan.ProductID)); n != 1 {
 		t.Fatalf("got %d licenses after retry, want 1", n)
 	}
@@ -161,8 +161,8 @@ func TestChargeRefundRevokesPurchasedLicense(t *testing.T) {
 	subOld, subNew := "sub_old_"+plan.Slug, "sub_new_"+plan.Slug
 	fake.invoicePaymentSubs = map[string]string{"pi_old": subOld, "pi_new": subNew}
 
-	h.fulfillCheckout(ctx, email, customer, subOld, checkoutMeta("cs_old_"+plan.Slug, plan.ID), "webhook")
-	h.fulfillCheckout(ctx, email, customer, subNew, checkoutMeta("cs_new_"+plan.Slug, plan.ID), "webhook")
+	h.fulfillCheckout(ctx, email, customer, subOld, "", checkoutMeta("cs_old_"+plan.Slug, plan.ID), "webhook")
+	h.fulfillCheckout(ctx, email, customer, subNew, "", checkoutMeta("cs_new_"+plan.Slug, plan.ID), "webhook")
 
 	refund := func(pi string) {
 		raw, _ := json.Marshal(map[string]any{
@@ -189,5 +189,42 @@ func TestChargeRefundRevokesPurchasedLicense(t *testing.T) {
 	refund("pi_unknown")
 	if got := statuses(); got[subNew] != model.StatusActive {
 		t.Fatalf("ambiguous refund changed licenses: %v", got)
+	}
+}
+
+// One-time purchases have no subscription to trace: each license stores
+// its payment intent, so a refund revokes the purchase it belongs to even
+// when the customer bought several lifetime licenses.
+func TestChargeRefundRevokesOneTimePurchase(t *testing.T) {
+	h, s, plan := setupFulfillTestWith(t, &fakeStripe{})
+	ctx := context.Background()
+	email := "buyer-" + plan.Slug + "@example.com"
+	customer := "cus_lifetime_" + plan.Slug
+	piOld, piNew := "pi_old_"+plan.Slug, "pi_new_"+plan.Slug
+
+	h.fulfillCheckout(ctx, email, customer, "", piOld, checkoutMeta("cs_old_"+plan.Slug, plan.ID), "webhook")
+	h.fulfillCheckout(ctx, email, customer, "", piNew, checkoutMeta("cs_new_"+plan.Slug, plan.ID), "webhook")
+	// Same payment under another session ID (e.g. replayed) adds nothing.
+	h.fulfillCheckout(ctx, email, customer, "", piNew, checkoutMeta("cs_dup_"+plan.Slug, plan.ID), "sync")
+
+	statuses := func() map[string]string {
+		out := map[string]string{}
+		for _, l := range licensesFor(t, s, email, plan.ProductID) {
+			out[l.StripePaymentIntentID] = l.Status
+		}
+		return out
+	}
+	if got := statuses(); len(got) != 2 {
+		t.Fatalf("licenses by payment intent = %v, want 2 purchases", got)
+	}
+
+	raw, _ := json.Marshal(map[string]any{
+		"id": "ch_" + piOld, "customer": customer, "payment_intent": piOld,
+		"amount": 9900, "amount_refunded": 9900, "refunded": true,
+	})
+	h.onChargeRefunded(ctx, raw)
+
+	if got := statuses(); got[piOld] != model.StatusRevoked || got[piNew] != model.StatusActive {
+		t.Fatalf("after refunding the older purchase: %v", got)
 	}
 }
