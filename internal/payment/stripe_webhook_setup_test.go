@@ -25,6 +25,7 @@ type fakeStripe struct {
 	existing           map[string]any
 	createStatus       int
 	invoicePaymentSubs map[string]string
+	invoicePaymentsErr int // HTTP status to fail invoice payment lists with
 	onRequest          func(*http.Request)
 
 	mu       sync.Mutex
@@ -42,6 +43,11 @@ func (f *fakeStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/invoice_payments":
+		if f.invoicePaymentsErr != 0 {
+			w.WriteHeader(f.invoicePaymentsErr)
+			_, _ = w.Write([]byte(`{"error":{"type":"api_error","message":"unavailable"}}`))
+			return
+		}
 		data := []any{}
 		if sub := f.invoicePaymentSubs[r.URL.Query().Get("payment[payment_intent]")]; sub != "" {
 			data = append(data, map[string]any{

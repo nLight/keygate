@@ -1,13 +1,19 @@
 package payment
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stripe/stripe-go/v82"
+	"github.com/stripe/stripe-go/v82/webhook"
 
 	keycrypto "github.com/tabloy/keygate/internal/crypto"
 	"github.com/tabloy/keygate/internal/model"
@@ -226,5 +232,93 @@ func TestChargeRefundRevokesOneTimePurchase(t *testing.T) {
 
 	if got := statuses(); got[piOld] != model.StatusRevoked || got[piNew] != model.StatusActive {
 		t.Fatalf("after refunding the older purchase: %v", got)
+	}
+}
+
+// A single license on the customer is not proof a charge bought it: a
+// license already mapped to a different payment must not be revoked.
+func TestChargeRefundIgnoresMismatchedPaymentIntent(t *testing.T) {
+	h, s, plan := setupFulfillTestWith(t, &fakeStripe{})
+	ctx := context.Background()
+	email := "buyer-" + plan.Slug + "@example.com"
+	customer := "cus_single_" + plan.Slug
+
+	h.fulfillCheckout(ctx, email, customer, "", "pi_actual_"+plan.Slug, checkoutMeta("cs_"+plan.Slug, plan.ID), "webhook")
+
+	raw, _ := json.Marshal(map[string]any{
+		"id": "ch_unrelated", "customer": customer, "payment_intent": "pi_unrelated_" + plan.Slug,
+		"amount": 500, "amount_refunded": 500, "refunded": true,
+	})
+	if err := h.onChargeRefunded(ctx, raw); err != nil {
+		t.Fatal(err)
+	}
+
+	lics := licensesFor(t, s, email, plan.ProductID)
+	if len(lics) != 1 || lics[0].Status != model.StatusActive {
+		t.Fatalf("licenses after unrelated refund: %+v", lics)
+	}
+}
+
+// A transient Stripe failure while resolving a refund must not be
+// acknowledged: the webhook answers non-2xx and releases the event, so
+// Stripe's redelivery of the same event still revokes the license.
+func TestChargeRefundWebhookRetriesAfterStripeFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	fake := &fakeStripe{}
+	h, s, plan := setupFulfillTestWith(t, fake)
+	ctx := context.Background()
+	email := "buyer-" + plan.Slug + "@example.com"
+	sub, pi := "sub_retry_"+plan.Slug, "pi_retry_"+plan.Slug
+
+	h.fulfillCheckout(ctx, email, "cus_retry_"+plan.Slug, sub, "", checkoutMeta("cs_retry_"+plan.Slug, plan.ID), "webhook")
+	fake.invoicePaymentSubs = map[string]string{pi: sub}
+
+	const secret = "whsec_test_retry"
+	h.SetWebhookSecret(secret)
+	r := gin.New()
+	r.POST("/stripe", h.Webhook)
+
+	payload, _ := json.Marshal(map[string]any{
+		"id": "evt_refund_" + plan.Slug, "object": "event", "type": "charge.refunded",
+		"api_version": stripe.APIVersion, "livemode": false, "created": time.Now().Unix(),
+		"data": map[string]any{"object": map[string]any{
+			"id": "ch_retry", "object": "charge", "customer": "cus_retry_" + plan.Slug,
+			"payment_intent": pi, "amount": 1299, "amount_refunded": 1299, "refunded": true,
+		}},
+	})
+	deliver := func() int {
+		signed := webhook.GenerateTestSignedPayload(&webhook.UnsignedPayload{Payload: payload, Secret: secret})
+		req := httptest.NewRequest(http.MethodPost, "/stripe", bytes.NewReader(payload))
+		req.Header.Set("Stripe-Signature", signed.Header)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+	status := func() string {
+		lics := licensesFor(t, s, email, plan.ProductID)
+		if len(lics) != 1 {
+			t.Fatalf("got %d licenses, want 1", len(lics))
+		}
+		return lics[0].Status
+	}
+
+	fake.mu.Lock()
+	fake.invoicePaymentsErr = http.StatusServiceUnavailable
+	fake.mu.Unlock()
+	if code := deliver(); code < 500 {
+		t.Fatalf("delivery during Stripe outage: status %d, want 5xx", code)
+	}
+	if got := status(); got != model.StatusActive {
+		t.Fatalf("license status after failed delivery = %s", got)
+	}
+
+	fake.mu.Lock()
+	fake.invoicePaymentsErr = 0
+	fake.mu.Unlock()
+	if code := deliver(); code != http.StatusOK {
+		t.Fatalf("redelivery: status %d, want 200", code)
+	}
+	if got := status(); got != model.StatusRevoked {
+		t.Fatalf("license status after redelivery = %s, want revoked", got)
 	}
 }

@@ -2,6 +2,7 @@ package payment
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -250,6 +251,10 @@ func (h *StripeHandler) Webhook(c *gin.Context) {
 	ctx := c.Request.Context()
 	slog.Info("stripe webhook received", "type", event.Type, "id", event.ID)
 
+	// handlerErr marks a failure that a redelivery could fix (Stripe API or
+	// database unavailable). Such events are released and answered non-2xx
+	// so Stripe retries them instead of the change being lost.
+	var handlerErr error
 	switch event.Type {
 	case "checkout.session.completed":
 		h.onCheckoutCompleted(ctx, event.Data.Raw)
@@ -262,7 +267,7 @@ func (h *StripeHandler) Webhook(c *gin.Context) {
 	case "invoice.payment_failed":
 		h.onPaymentFailed(ctx, event.Data.Raw)
 	case "charge.refunded":
-		h.onChargeRefunded(ctx, event.Data.Raw)
+		handlerErr = h.onChargeRefunded(ctx, event.Data.Raw)
 	case "charge.dispute.created":
 		h.onDisputeCreated(ctx, event.Data.Raw)
 	case "charge.dispute.closed":
@@ -281,6 +286,16 @@ func (h *StripeHandler) Webhook(c *gin.Context) {
 		h.onCustomerUpdated(ctx, event.Data.Raw)
 	default:
 		slog.Warn("stripe webhook: unhandled event type", "type", event.Type)
+	}
+
+	if handlerErr != nil {
+		slog.Error("stripe webhook: handler failed, releasing for retry",
+			"type", event.Type, "id", event.ID, "error", handlerErr)
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		h.Store.ForgetProcessedEvent(releaseCtx, "stripe", event.ID)
+		response.Internal(c)
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"received": true})
@@ -852,7 +867,7 @@ func (h *StripeHandler) onPaymentFailed(ctx context.Context, raw json.RawMessage
 	}
 }
 
-func (h *StripeHandler) onChargeRefunded(ctx context.Context, raw json.RawMessage) {
+func (h *StripeHandler) onChargeRefunded(ctx context.Context, raw json.RawMessage) error {
 	var data struct {
 		ID             string `json:"id"`
 		Customer       string `json:"customer"`
@@ -862,17 +877,22 @@ func (h *StripeHandler) onChargeRefunded(ctx context.Context, raw json.RawMessag
 		PaymentIntent  string `json:"payment_intent"`
 	}
 	if json.Unmarshal(raw, &data) != nil {
-		return
+		return nil
 	}
 
-	lic := h.licenseForCharge(ctx, data.ID, data.Customer, data.PaymentIntent)
+	lic, err := h.licenseForCharge(ctx, data.ID, data.Customer, data.PaymentIntent)
+	if err != nil {
+		return fmt.Errorf("resolve license for charge %s: %w", data.ID, err)
+	}
 	if lic == nil {
-		return
+		return nil
 	}
 
 	if data.Refunded {
 		lic.Status = model.StatusRevoked
-		_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, "status")
+		if err := h.Store.UpdateLicenseAndSubscription(ctx, lic, "status"); err != nil {
+			return fmt.Errorf("revoke license %s: %w", lic.ID, err)
+		}
 
 		h.Store.Audit(ctx, &model.AuditLog{
 			Entity: "license", EntityID: lic.ID, Action: "revoked",
@@ -886,48 +906,71 @@ func (h *StripeHandler) onChargeRefunded(ctx context.Context, raw json.RawMessag
 			Changes:   map[string]any{"amount_refunded": data.AmountRefunded, "provider": "stripe"},
 		})
 	}
+	return nil
 }
 
-// licenseForCharge resolves the license a charge paid for. A customer can
-// hold several licenses (one per purchase), so the customer alone doesn't
+// licenseForCharge resolves the license a charge paid for, or nil when no
+// license can be attributed to it with certainty. A customer can hold
+// several licenses (one per purchase), so the customer alone doesn't
 // identify it: one-time purchases store their payment intent, and
 // subscription charges are traced through their invoice to the
-// subscription, which backs exactly one license. Licenses bought before
-// payment intents were stored fall back to the customer, only when that
-// is unambiguous.
-func (h *StripeHandler) licenseForCharge(ctx context.Context, chargeID, customerID, paymentIntentID string) *model.License {
+// subscription, which backs exactly one license. Only licenses with
+// neither mapping (bought before payment intents were stored) fall back to
+// the customer, and only when exactly one such license exists.
+//
+// An error means the lookup itself failed and may succeed on retry; it is
+// never collapsed into "no license", which would acknowledge the refund.
+func (h *StripeHandler) licenseForCharge(ctx context.Context, chargeID, customerID, paymentIntentID string) (*model.License, error) {
 	if paymentIntentID != "" {
-		if lic, err := h.Store.FindLicenseByStripePaymentIntent(ctx, paymentIntentID); err == nil {
-			return lic
+		lic, err := h.Store.FindLicenseByStripePaymentIntent(ctx, paymentIntentID)
+		if err == nil {
+			return lic, nil
 		}
-		if subID := h.subscriptionForPaymentIntent(paymentIntentID); subID != "" {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+
+		subID, err := h.subscriptionForPaymentIntent(paymentIntentID)
+		if err != nil {
+			return nil, err
+		}
+		if subID != "" {
 			lic, err := h.Store.FindLicenseByStripeSubscription(ctx, subID)
-			if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
 				slog.Warn("stripe charge: no license for subscription", "charge_id", chargeID, "subscription_id", subID)
-				return nil
+				return nil, nil
 			}
-			return lic
+			return lic, err
 		}
 	}
 
 	if customerID == "" {
-		return nil
+		return nil, nil
 	}
 	lics, err := h.Store.ListLicensesByStripeCustomer(ctx, customerID)
-	if err != nil || len(lics) == 0 {
-		return nil
+	if err != nil {
+		return nil, err
 	}
-	if len(lics) > 1 {
-		slog.Error("stripe charge: customer has several licenses and the charge has no subscription; not guessing",
-			"charge_id", chargeID, "customer_id", customerID, "licenses", len(lics))
-		return nil
+	var unmapped []*model.License
+	for _, l := range lics {
+		if l.StripePaymentIntentID == "" && l.StripeSubscriptionID == "" {
+			unmapped = append(unmapped, l)
+		}
 	}
-	return lics[0]
+	if len(unmapped) != 1 {
+		if len(lics) > 0 {
+			slog.Error("stripe charge: cannot attribute charge to a license; not revoking",
+				"charge_id", chargeID, "customer_id", customerID, "payment_intent", paymentIntentID,
+				"licenses", len(lics), "unmapped_licenses", len(unmapped))
+		}
+		return nil, nil
+	}
+	return unmapped[0], nil
 }
 
 // subscriptionForPaymentIntent returns the subscription whose invoice was
 // paid by the payment intent, or "" if it wasn't an invoice payment.
-func (h *StripeHandler) subscriptionForPaymentIntent(paymentIntentID string) string {
+func (h *StripeHandler) subscriptionForPaymentIntent(paymentIntentID string) (string, error) {
 	params := &stripe.InvoicePaymentListParams{
 		Payment: &stripe.InvoicePaymentListPaymentParams{
 			Type:          stripe.String("payment_intent"),
@@ -940,13 +983,13 @@ func (h *StripeHandler) subscriptionForPaymentIntent(paymentIntentID string) str
 		inv := iter.InvoicePayment().Invoice
 		if inv != nil && inv.Parent != nil && inv.Parent.SubscriptionDetails != nil &&
 			inv.Parent.SubscriptionDetails.Subscription != nil {
-			return inv.Parent.SubscriptionDetails.Subscription.ID
+			return inv.Parent.SubscriptionDetails.Subscription.ID, nil
 		}
 	}
 	if err := iter.Err(); err != nil {
-		slog.Warn("stripe: list invoice payments failed", "payment_intent", paymentIntentID, "error", err)
+		return "", fmt.Errorf("list invoice payments for %s: %w", paymentIntentID, err)
 	}
-	return ""
+	return "", nil
 }
 
 func (h *StripeHandler) CancelSubscription(c *gin.Context) {
