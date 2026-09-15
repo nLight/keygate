@@ -51,19 +51,28 @@ func (s *Store) GetPublicSettings(ctx context.Context) (map[string]string, error
 }
 
 func (s *Store) SetSetting(ctx context.Context, key, value string) error {
+	return upsertSetting(ctx, s.DB, key, value)
+}
+
+// SetSettings writes all settings in one transaction, so values that only
+// make sense together (e.g. a webhook endpoint ID and its signing secret)
+// are never persisted half-updated.
+func (s *Store) SetSettings(ctx context.Context, settings map[string]string) error {
+	return s.DB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		for key, value := range settings {
+			if err := upsertSetting(ctx, tx, key, value); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func upsertSetting(ctx context.Context, db bun.IDB, key, value string) error {
 	setting := &Setting{Key: key, Value: value}
-	_, err := s.DB.NewInsert().Model(setting).
+	_, err := db.NewInsert().Model(setting).
 		On("CONFLICT (key) DO UPDATE").
 		Set("value = EXCLUDED.value").
 		Exec(ctx)
 	return err
-}
-
-func (s *Store) SetSettings(ctx context.Context, settings map[string]string) error {
-	for key, value := range settings {
-		if err := s.SetSetting(ctx, key, value); err != nil {
-			return err
-		}
-	}
-	return nil
 }
