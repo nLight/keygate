@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stripe/stripe-go/v82"
 
+	"github.com/tabloy/keygate/internal/crypto"
 	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/store"
 )
@@ -68,6 +69,13 @@ func setupRevokeTest(t *testing.T, fake *fakeStripeAPI, subscriptionIDs ...strin
 	if err := s.RunMigrations("../../db/migrations"); err != nil {
 		t.Fatal(err)
 	}
+	// CreateLicense encrypts the key at rest and refuses to write without
+	// a configured AEAD.
+	aead, err := crypto.NewAESGCMFromHex(strings.Repeat("ab", crypto.MasterKeyBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.LicenseKeyAEAD = aead
 
 	ctx := context.Background()
 	const email = "revoke@example.com"
