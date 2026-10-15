@@ -1,5 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { Ban, Check, Copy, Eye, Package, Pause, Pencil, Play, Plus, RefreshCw, Search, Trash2 } from "lucide-react"
+import {
+  Ban,
+  Check,
+  Copy,
+  Eye,
+  Package,
+  Pause,
+  Pencil,
+  Play,
+  Plus,
+  RefreshCw,
+  ScrollText,
+  Search,
+  Trash2,
+} from "lucide-react"
 import { useState } from "react"
 import { Link } from "react-router-dom"
 import { showToast } from "@/components/toast"
@@ -632,6 +646,21 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
                     <p className="text-muted-foreground">{t("common.created")}</p>
                     <p className="mt-1">{formatDate(lic.created_at)}</p>
                   </div>
+                  {/* "Canceled" with no date leaves the admin guessing when —
+                      and through which path — the subscription ended. The
+                      audit log holds the how; this holds the when. */}
+                  {lic.canceled_at && (
+                    <div>
+                      <p className="text-muted-foreground">{t("licenses.canceledAt")}</p>
+                      <p className="mt-1">{formatDate(lic.canceled_at)}</p>
+                    </div>
+                  )}
+                  {lic.suspended_at && (
+                    <div>
+                      <p className="text-muted-foreground">{t("licenses.suspendedAt")}</p>
+                      <p className="mt-1">{formatDate(lic.suspended_at)}</p>
+                    </div>
+                  )}
                 </div>
                 {lic.notes && (
                   <div className="text-sm">
@@ -744,6 +773,14 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
                   )}
                   <Button variant="outline" size="sm" onClick={() => setChangingPlan(true)}>
                     {t("licenses.changePlan")}
+                  </Button>
+                  {/* The audit trail is the only record of which path ended
+                      this license (portal cancel, admin revoke, Stripe
+                      webhook) — reach it without hand-copying the ID. */}
+                  <Button variant="ghost" size="sm" asChild>
+                    <Link to={`/admin/audit?entity=license&entity_id=${lic.id}`}>
+                      <ScrollText className="h-4 w-4 mr-1" /> {t("licenses.history")}
+                    </Link>
                   </Button>
                 </div>
 

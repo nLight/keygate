@@ -25,13 +25,16 @@ type fakeStripe struct {
 	existing           map[string]any
 	createStatus       int
 	invoicePaymentSubs map[string]string
-	invoicePaymentsErr int // HTTP status to fail invoice payment lists with
+	invoicePaymentsErr int               // HTTP status to fail invoice payment lists with
+	subStatuses        map[string]string // subscription ID -> status served by GET
+	subGetErr          int               // HTTP status to fail subscription reads with
 	onRequest          func(*http.Request)
 
-	mu       sync.Mutex
-	created  []string // raw form bodies of create requests
-	deleted  []string // endpoint IDs
-	getCount int
+	mu           sync.Mutex
+	created      []string // raw form bodies of create requests
+	deleted      []string // endpoint IDs
+	canceledSubs []string // subscription IDs cancelled via DELETE
+	getCount     int
 }
 
 func (f *fakeStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -79,6 +82,30 @@ func (f *fakeStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"id": "we_new", "object": "webhook_endpoint", "secret": "whsec_new",
 			"status": "enabled", "url": r.PostForm.Get("url"), "api_version": r.PostForm.Get("api_version"),
 		})
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/subscriptions/"):
+		// Only subscriptions a test registered are known; everything
+		// else keeps answering 404 as before, so unrelated lookups
+		// (resolvePlan) behave the way those tests expect.
+		if f.subGetErr != 0 {
+			w.WriteHeader(f.subGetErr)
+			_, _ = w.Write([]byte(`{"error":{"type":"api_error","message":"unavailable"}}`))
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/v1/subscriptions/")
+		status, ok := f.subStatuses[id]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"no such subscription"}}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": id, "object": "subscription", "status": status,
+			"items": map[string]any{"object": "list", "has_more": false, "data": []any{}},
+		})
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/subscriptions/"):
+		id := strings.TrimPrefix(r.URL.Path, "/v1/subscriptions/")
+		f.canceledSubs = append(f.canceledSubs, id)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "object": "subscription", "status": "canceled"})
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/webhook_endpoints/"):
 		id := strings.TrimPrefix(r.URL.Path, "/v1/webhook_endpoints/")
 		f.deleted = append(f.deleted, id)

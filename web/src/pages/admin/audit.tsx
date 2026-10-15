@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query"
 import { useState } from "react"
+import { useSearchParams } from "react-router-dom"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
 import {
@@ -20,8 +21,11 @@ import { formatDate } from "@/lib/utils"
 
 export default function AuditPage() {
   const { t } = useI18n()
-  const [entityFilter, setEntityFilter] = useState("")
-  const [entityIdFilter, setEntityIdFilter] = useState("")
+  // Seeded from the query string so other pages can deep-link into the
+  // history of one record (e.g. "when and how was this license canceled").
+  const [searchParams] = useSearchParams()
+  const [entityFilter, setEntityFilter] = useState(searchParams.get("entity") || "")
+  const [entityIdFilter, setEntityIdFilter] = useState(searchParams.get("entity_id") || "")
   const [productFilter, setProductFilter] = useState("")
   const [page, setPage] = useState(0)
   const limit = 30
