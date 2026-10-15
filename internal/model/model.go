@@ -295,10 +295,15 @@ type License struct {
 	// refunds through.
 	StripePaymentIntentID string `bun:",unique,nullzero" json:"stripe_payment_intent_id,omitempty"`
 
-	Status      string     `bun:",notnull,default:'active'" json:"status"`
-	ValidFrom   time.Time  `bun:",notnull,default:now()" json:"valid_from"`
-	ValidUntil  *time.Time `json:"valid_until,omitempty"`
+	Status     string     `bun:",notnull,default:'active'" json:"status"`
+	ValidFrom  time.Time  `bun:",notnull,default:now()" json:"valid_from"`
+	ValidUntil *time.Time `json:"valid_until,omitempty"`
+	// CanceledAt is when the subscription behind the license ended.
+	// A revoked license is a different event — access pulled by the
+	// merchant — and carries RevokedAt instead, so the two are never
+	// read as one.
 	CanceledAt  *time.Time `json:"canceled_at,omitempty"`
+	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
 	SuspendedAt *time.Time `json:"suspended_at,omitempty"`
 	// PastDueAt anchors the dunning-email ladder. Set by the
 	// payment-failed handler when the license first enters past_due;

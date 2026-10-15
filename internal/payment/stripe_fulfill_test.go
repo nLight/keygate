@@ -157,7 +157,7 @@ func TestFulfillCheckoutReleasesClaimWhenContextCanceled(t *testing.T) {
 }
 
 // Two purchases by the same Stripe customer: refunding the older one must
-// revoke its license, not the customer's newest.
+// act on its license, not the customer's newest.
 func TestChargeRefundRevokesPurchasedLicense(t *testing.T) {
 	fake := &fakeStripe{}
 	h, s, plan := setupFulfillTestWith(t, fake)
@@ -166,6 +166,9 @@ func TestChargeRefundRevokesPurchasedLicense(t *testing.T) {
 	customer := "cus_shared_" + plan.Slug
 	subOld, subNew := "sub_old_"+plan.Slug, "sub_new_"+plan.Slug
 	fake.invoicePaymentSubs = map[string]string{"pi_old": subOld, "pi_new": subNew}
+	// The refunded subscription was cancelled at Stripe too; the other
+	// one is untouched and must stay that way.
+	fake.subStatuses = map[string]string{subOld: "canceled", subNew: "active"}
 
 	h.fulfillCheckout(ctx, email, customer, subOld, "", checkoutMeta("cs_old_"+plan.Slug, plan.ID), "webhook")
 	h.fulfillCheckout(ctx, email, customer, subNew, "", checkoutMeta("cs_new_"+plan.Slug, plan.ID), "webhook")
@@ -186,7 +189,7 @@ func TestChargeRefundRevokesPurchasedLicense(t *testing.T) {
 	}
 
 	refund("pi_old")
-	if got := statuses(); got[subOld] != model.StatusRevoked || got[subNew] != model.StatusActive {
+	if got := statuses(); got[subOld] != model.StatusCanceled || got[subNew] != model.StatusActive {
 		t.Fatalf("after refunding the older purchase: %v", got)
 	}
 
@@ -272,6 +275,7 @@ func TestChargeRefundWebhookRetriesAfterStripeFailure(t *testing.T) {
 
 	h.fulfillCheckout(ctx, email, "cus_retry_"+plan.Slug, sub, "", checkoutMeta("cs_retry_"+plan.Slug, plan.ID), "webhook")
 	fake.invoicePaymentSubs = map[string]string{pi: sub}
+	fake.subStatuses = map[string]string{sub: "canceled"}
 
 	const secret = "whsec_test_retry"
 	h.SetWebhookSecret(secret)
@@ -318,7 +322,111 @@ func TestChargeRefundWebhookRetriesAfterStripeFailure(t *testing.T) {
 	if code := deliver(); code != http.StatusOK {
 		t.Fatalf("redelivery: status %d, want 200", code)
 	}
-	if got := status(); got != model.StatusRevoked {
-		t.Fatalf("license status after redelivery = %s, want revoked", got)
+	if got := status(); got != model.StatusCanceled {
+		t.Fatalf("license status after redelivery = %s, want canceled", got)
+	}
+}
+
+// A refund is not a cancellation. Refunding one month of a live
+// subscription — a goodwill refund — must leave the customer's access
+// alone: Stripe keeps billing, so taking the license away would charge
+// them for a product they can no longer open.
+func TestChargeRefundKeepsLicenseWhileSubscriptionLives(t *testing.T) {
+	fake := &fakeStripe{}
+	h, s, plan := setupFulfillTestWith(t, fake)
+	ctx := context.Background()
+	email := "buyer-" + plan.Slug + "@example.com"
+	customer := "cus_goodwill_" + plan.Slug
+	sub, pi := "sub_goodwill_"+plan.Slug, "pi_goodwill_"+plan.Slug
+	fake.invoicePaymentSubs = map[string]string{pi: sub}
+	fake.subStatuses = map[string]string{sub: "active"}
+
+	h.fulfillCheckout(ctx, email, customer, sub, "", checkoutMeta("cs_"+plan.Slug, plan.ID), "webhook")
+
+	raw, _ := json.Marshal(map[string]any{
+		"id": "ch_" + pi, "customer": customer, "payment_intent": pi,
+		"amount": 1299, "amount_refunded": 1299, "refunded": true,
+	})
+	if err := h.onChargeRefunded(ctx, raw); err != nil {
+		t.Fatal(err)
+	}
+
+	lics := licensesFor(t, s, email, plan.ProductID)
+	if len(lics) != 1 || lics[0].Status != model.StatusActive {
+		t.Fatalf("licenses after goodwill refund: %+v", lics)
+	}
+	if lics[0].CanceledAt != nil {
+		t.Fatalf("canceled_at stamped on a live subscription: %v", lics[0].CanceledAt)
+	}
+
+	fake.mu.Lock()
+	canceled := append([]string(nil), fake.canceledSubs...)
+	fake.mu.Unlock()
+	if len(canceled) != 0 {
+		t.Fatalf("refund cancelled subscriptions at Stripe: %v", canceled)
+	}
+}
+
+// Refunding a subscription Stripe has already cancelled ends the license
+// and dates it, so the admin panel can line the cancellation up against
+// the Stripe timeline instead of showing an undated "canceled".
+func TestChargeRefundMirrorsCanceledSubscription(t *testing.T) {
+	fake := &fakeStripe{}
+	h, s, plan := setupFulfillTestWith(t, fake)
+	ctx := context.Background()
+	email := "buyer-" + plan.Slug + "@example.com"
+	customer := "cus_mirror_" + plan.Slug
+	sub, pi := "sub_mirror_"+plan.Slug, "pi_mirror_"+plan.Slug
+	fake.invoicePaymentSubs = map[string]string{pi: sub}
+	fake.subStatuses = map[string]string{sub: "canceled"}
+
+	h.fulfillCheckout(ctx, email, customer, sub, "", checkoutMeta("cs_"+plan.Slug, plan.ID), "webhook")
+
+	raw, _ := json.Marshal(map[string]any{
+		"id": "ch_" + pi, "customer": customer, "payment_intent": pi,
+		"amount": 1299, "amount_refunded": 1299, "refunded": true,
+	})
+	if err := h.onChargeRefunded(ctx, raw); err != nil {
+		t.Fatal(err)
+	}
+
+	lics := licensesFor(t, s, email, plan.ProductID)
+	if len(lics) != 1 || lics[0].Status != model.StatusCanceled {
+		t.Fatalf("licenses after refunding a cancelled subscription: %+v", lics)
+	}
+	if lics[0].CanceledAt == nil {
+		t.Fatal("canceled_at not stamped")
+	}
+}
+
+// The subscription read is the whole point of the refund path: if Stripe
+// can't be reached, the event must fail so it is redelivered, rather than
+// leaving the license at a status nobody checked.
+func TestChargeRefundFailsWhenSubscriptionUnreadable(t *testing.T) {
+	fake := &fakeStripe{}
+	h, s, plan := setupFulfillTestWith(t, fake)
+	ctx := context.Background()
+	email := "buyer-" + plan.Slug + "@example.com"
+	customer := "cus_unreadable_" + plan.Slug
+	sub, pi := "sub_unreadable_"+plan.Slug, "pi_unreadable_"+plan.Slug
+	fake.invoicePaymentSubs = map[string]string{pi: sub}
+
+	h.fulfillCheckout(ctx, email, customer, sub, "", checkoutMeta("cs_"+plan.Slug, plan.ID), "webhook")
+
+	fake.mu.Lock()
+	fake.subGetErr = http.StatusServiceUnavailable
+	fake.mu.Unlock()
+
+	raw, _ := json.Marshal(map[string]any{
+		"id": "ch_" + pi, "customer": customer, "payment_intent": pi,
+		"amount": 1299, "amount_refunded": 1299, "refunded": true,
+	})
+	if err := h.onChargeRefunded(ctx, raw); err == nil {
+		t.Fatal("refund acknowledged while Stripe was unreachable")
+	}
+
+	lics := licensesFor(t, s, email, plan.ProductID)
+	if len(lics) != 1 || lics[0].Status != model.StatusActive {
+		t.Fatalf("licenses after unreadable refund: %+v", lics)
 	}
 }

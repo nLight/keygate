@@ -692,6 +692,48 @@ func (sub *webhookSubscription) currentPeriodEnd() int64 {
 	return end
 }
 
+// applySubscriptionStatus maps a Stripe subscription status onto the
+// license's lifecycle columns and returns the columns to write. Shared by
+// the subscription webhook and by the refund reconciliation so the two
+// never drift into disagreeing about what a Stripe status means.
+func applySubscriptionStatus(lic *model.License, status string) []string {
+	switch status {
+	case "active":
+		lic.Status = model.StatusActive
+		// Recovery: customer fixed the card. Clear the dunning
+		// anchor so a fresh past_due episode in the future starts
+		// the ladder from day 0, not from the original failure.
+		lic.PastDueAt = nil
+		// The subscription is live again, so a cancellation stamp
+		// left over from an earlier episode is now a lie — and
+		// canceled_at is always written, so leaving it would rewrite
+		// the stale value instead of clearing it.
+		lic.CanceledAt = nil
+	case "past_due":
+		// Idempotent entry: only stamp past_due_at on first entry
+		// (or when re-entering after a recovery). Without this a
+		// burst of repeated payment_failed webhooks would reset the
+		// clock each time and the day-7 / day-14 reminders would
+		// keep getting pushed out.
+		lic.Status = model.StatusPastDue
+		if lic.PastDueAt == nil {
+			now := time.Now()
+			lic.PastDueAt = &now
+		}
+	case "trialing":
+		lic.Status = model.StatusTrialing
+		lic.CanceledAt = nil
+	case "canceled", "unpaid":
+		lic.Status = model.StatusCanceled
+		if lic.CanceledAt == nil {
+			now := time.Now()
+			lic.CanceledAt = &now
+		}
+		lic.PastDueAt = nil
+	}
+	return []string{"status", "canceled_at", "past_due_at"}
+}
+
 func (h *StripeHandler) onSubscriptionUpdated(ctx context.Context, raw json.RawMessage) {
 	var data webhookSubscription
 	if json.Unmarshal(raw, &data) != nil {
@@ -713,34 +755,7 @@ func (h *StripeHandler) onSubscriptionUpdated(ctx context.Context, raw json.RawM
 	if lic.PastDueAt != nil {
 		episode = lic.PastDueAt.Unix()
 	}
-	cols := []string{"status", "canceled_at", "past_due_at"}
-
-	switch data.Status {
-	case "active":
-		lic.Status = model.StatusActive
-		// Recovery: customer fixed the card. Clear the dunning
-		// anchor so a fresh past_due episode in the future starts
-		// the ladder from day 0, not from the original failure.
-		lic.PastDueAt = nil
-	case "past_due":
-		// Idempotent entry: only stamp past_due_at on first entry
-		// (or when re-entering after a recovery). Without this a
-		// burst of repeated payment_failed webhooks would reset the
-		// clock each time and the day-7 / day-14 reminders would
-		// keep getting pushed out.
-		lic.Status = model.StatusPastDue
-		if lic.PastDueAt == nil {
-			now := time.Now()
-			lic.PastDueAt = &now
-		}
-	case "trialing":
-		lic.Status = model.StatusTrialing
-	case "canceled", "unpaid":
-		lic.Status = model.StatusCanceled
-		now := time.Now()
-		lic.CanceledAt = &now
-		lic.PastDueAt = nil
-	}
+	cols := applySubscriptionStatus(lic, data.Status)
 
 	periodEnd := data.currentPeriodEnd()
 	if data.Items.HasMore {
@@ -889,8 +904,41 @@ func (h *StripeHandler) onChargeRefunded(ctx context.Context, raw json.RawMessag
 	}
 
 	if data.Refunded {
+		// A refund is not a cancellation. Stripe keeps a subscription
+		// running when one of its charges is refunded, and a merchant
+		// refunding a single month out of goodwill does not mean the
+		// customer should lose access. So don't infer the license's fate
+		// from the refund: ask Stripe what the subscription actually is
+		// now and mirror that.
+		if lic.StripeSubscriptionID != "" {
+			status, err := h.reconcileSubscription(ctx, lic)
+			if err != nil {
+				return fmt.Errorf("reconcile subscription %s after refund: %w", lic.StripeSubscriptionID, err)
+			}
+			h.Store.Audit(ctx, &model.AuditLog{
+				Entity: "license", EntityID: lic.ID, Action: "refunded",
+				ActorType: "webhook",
+				Changes: map[string]any{
+					"reason": "full_refund", "provider": "stripe", "charge_id": data.ID,
+					"amount_refunded": data.AmountRefunded,
+					// What Stripe says about the subscription itself, so
+					// the trail shows whether billing actually stopped.
+					"subscription_id": lic.StripeSubscriptionID, "subscription_status": status,
+					"license_status": lic.Status,
+				},
+			})
+			return nil
+		}
+
+		// No subscription behind the purchase (one-time / lifetime):
+		// refunding it undoes the sale outright, and there is no provider
+		// state left that would ever say so.
 		lic.Status = model.StatusRevoked
-		if err := h.Store.UpdateLicenseAndSubscription(ctx, lic, "status"); err != nil {
+		if lic.CanceledAt == nil {
+			now := time.Now()
+			lic.CanceledAt = &now
+		}
+		if err := h.Store.UpdateLicenseAndSubscription(ctx, lic, "status", "canceled_at"); err != nil {
 			return fmt.Errorf("revoke license %s: %w", lic.ID, err)
 		}
 
@@ -907,6 +955,49 @@ func (h *StripeHandler) onChargeRefunded(ctx context.Context, raw json.RawMessag
 		})
 	}
 	return nil
+}
+
+// reconcileSubscription re-reads the subscription from Stripe and writes
+// the license to match it, returning the Stripe status it found.
+//
+// Used where a webhook tells us money moved but not what became of the
+// subscription. Guessing there is how a license ends up marked canceled
+// while Stripe keeps billing the card — or revoked while the customer is
+// still paying. An error means the read or the write failed and the event
+// must be redelivered, never that the subscription is gone.
+func (h *StripeHandler) reconcileSubscription(ctx context.Context, lic *model.License) (string, error) {
+	sub, err := subscription.Get(lic.StripeSubscriptionID, nil)
+	if err != nil {
+		return "", err
+	}
+
+	cols := applySubscriptionStatus(lic, string(sub.Status))
+
+	periodEnd := int64(0)
+	if sub.Items != nil {
+		for _, item := range sub.Items.Data {
+			if item.CurrentPeriodEnd > periodEnd {
+				periodEnd = item.CurrentPeriodEnd
+			}
+		}
+		// The embedded page is truncated; a later item may carry the
+		// latest period.
+		if sub.Items.HasMore {
+			if end, listErr := h.subscriptionPeriodEnd(sub.ID); listErr == nil && end > periodEnd {
+				periodEnd = end
+			}
+		}
+	}
+	if periodEnd > 0 {
+		until := time.Unix(periodEnd, 0)
+		lic.ValidUntil = &until
+		cols = append(cols, "valid_until")
+	}
+
+	if err := h.Store.UpdateLicenseAndSubscription(ctx, lic, cols...); err != nil {
+		return "", err
+	}
+	return string(sub.Status), nil
 }
 
 // licenseForCharge resolves the license a charge paid for, or nil when no

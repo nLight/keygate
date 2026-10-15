@@ -1028,22 +1028,46 @@ func (h *AdminHandler) RevokeLicense(c *gin.Context) {
 	if !h.checkLicenseScope(c, id) {
 		return
 	}
+	lic, err := h.Store.FindLicenseByID(c, id)
+	if err != nil {
+		response.NotFound(c, "license not found")
+		return
+	}
+
+	// Cutting off access is the part that must not depend on Stripe being
+	// reachable — revoke is how a merchant stops abuse — so the local
+	// write happens first and is never rolled back by a provider failure.
 	if err := h.Store.RevokeLicense(c, id); err != nil {
 		response.NotFound(c, err.Error())
 		return
 	}
+
+	// Stripe does not stop billing because we stopped honouring the
+	// license: without this the customer loses access and keeps paying
+	// every month. A failure here is reported rather than swallowed —
+	// the admin has to know the card is still being charged.
+	providerResult := "no_subscription"
+	if lic.StripeSubscriptionID != "" {
+		if _, cancelErr := subscription.Cancel(lic.StripeSubscriptionID, nil); cancelErr != nil {
+			providerResult = "stripe_cancel_failed"
+			slog.Error("stripe subscription cancel on revoke failed",
+				"subscription_id", lic.StripeSubscriptionID, "license_id", id, "error", cancelErr)
+		} else {
+			providerResult = "stripe_subscription_canceled"
+		}
+	}
+
 	h.Store.Audit(c, &model.AuditLog{
 		Entity: "license", EntityID: id, Action: "revoked",
 		ActorType: "admin", ActorID: adminID(c),
+		Changes: map[string]any{"provider_result": providerResult},
 	})
 	if h.Webhook != nil {
-		if lic, err := h.Store.FindLicenseByID(c, id); err == nil {
-			h.Webhook.Dispatch(c, lic.ProductID, "license.revoked", map[string]any{
-				"license_id": id, "email": lic.Email,
-			})
-		}
+		h.Webhook.Dispatch(c, lic.ProductID, "license.revoked", map[string]any{
+			"license_id": id, "email": lic.Email,
+		})
 	}
-	response.OK(c, gin.H{"status": "revoked"})
+	response.OK(c, gin.H{"status": "revoked", "provider_result": providerResult})
 }
 
 func (h *AdminHandler) RefundLicense(c *gin.Context) {
