@@ -237,8 +237,11 @@ func (s *Store) FindLicenseByID(ctx context.Context, id string) (*model.License,
 
 func (s *Store) RevokeLicense(ctx context.Context, id string) error {
 	_, _ = s.DB.NewDelete().Model((*model.Activation)(nil)).Where("license_id = ?", id).Exec(ctx)
+	now := time.Now()
+	// Only stamp the first revocation: a repeated call must not move the
+	// date, which is the record of when access was actually pulled.
 	res, err := s.DB.NewUpdate().Model((*model.License)(nil)).
-		Set("status = ?, updated_at = ?", model.StatusRevoked, time.Now()).
+		Set("status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?", model.StatusRevoked, now, now).
 		Where("id = ?", id).Exec(ctx)
 	if err != nil {
 		return err

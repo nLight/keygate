@@ -161,6 +161,11 @@ const en = {
   "licenses.usage": "Usage",
   "licenses.validFrom": "Valid From",
   "licenses.canceledAt": "Canceled",
+  "licenses.revokedAt": "Revoked",
+  "licenses.revokeCancelsSubscription":
+    "This also cancels the subscription at the payment provider. Billing stops and it cannot be resumed from here.",
+  "licenses.revokeBillingFailed":
+    "License revoked, but the subscription could not be canceled at the payment provider — the customer is still being billed. Cancel it in the provider dashboard.",
   "licenses.suspendedAt": "Suspended",
   "licenses.history": "History",
   "licenses.payment": "Payment",
