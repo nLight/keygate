@@ -213,8 +213,7 @@ export const admin = {
   // Empty valid_until clears the expiry (perpetual license).
   setLicenseValidUntil: (id: string, validUntil: string) =>
     post<License>(`/admin/licenses/${id}/valid-until`, { valid_until: validUntil }),
-  revokeLicense: (id: string) =>
-    post<{ status: string; provider_result: string }>(`/admin/licenses/${id}/revoke`),
+  revokeLicense: (id: string) => post<{ status: string; provider_result: string }>(`/admin/licenses/${id}/revoke`),
   suspendLicense: (id: string) => post(`/admin/licenses/${id}/suspend`),
   reinstateLicense: (id: string) => post(`/admin/licenses/${id}/reinstate`),
   refundLicense: (id: string) => post(`/admin/licenses/${id}/refund`),

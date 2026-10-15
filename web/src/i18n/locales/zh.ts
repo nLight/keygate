@@ -157,7 +157,8 @@ const zh = {
   "licenses.canceledAt": "取消时间",
   "licenses.revokedAt": "吊销时间",
   "licenses.revokeCancelsSubscription": "此操作同时会在支付服务商处取消订阅。扣款将停止，且无法在此恢复。",
-  "licenses.revokeBillingFailed": "许可证已吊销，但未能在支付服务商处取消订阅——客户仍在被扣款。请在服务商后台手动取消。",
+  "licenses.revokeBillingFailed":
+    "许可证已吊销，但未能在支付服务商处取消订阅——客户仍在被扣款。请在服务商后台手动取消。",
   "licenses.suspendedAt": "暂停时间",
   "licenses.history": "历史记录",
   "licenses.payment": "支付方式",
