@@ -620,9 +620,12 @@ func (s *Store) GetTopUsers(ctx context.Context, productID string, limit int) ([
 		ColumnExpr("COUNT(DISTINCT l.id)::int AS license_count").
 		ColumnExpr("COUNT(DISTINCT l.id) FILTER (WHERE l.status = 'active')::int AS active_count").
 		ColumnExpr("COALESCE(SUM(uc.total_usage), 0) AS total_usage").
-		ColumnExpr("COUNT(DISTINCT a.id)::int AS activation_count").
+		ColumnExpr("COALESCE(SUM(ac.activations), 0)::int AS activation_count").
+		// Usage and devices are each counted per licence before the
+		// join: joined row by row, a licence's usage was added once for
+		// every device it runs on.
 		Join("LEFT JOIN (SELECT license_id, SUM(quantity) AS total_usage FROM usage_events GROUP BY license_id) uc ON uc.license_id = l.id").
-		Join("LEFT JOIN activations a ON a.license_id = l.id").
+		Join("LEFT JOIN (SELECT license_id, COUNT(*) AS activations FROM activations GROUP BY license_id) ac ON ac.license_id = l.id").
 		// Exclude admin users from customer rankings
 		Where("l.email NOT IN (SELECT email FROM users WHERE role IN ('owner', 'admin'))").
 		GroupExpr("l.email, l.user_id").
