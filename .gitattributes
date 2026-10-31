@@ -1,0 +1,4 @@
+# Check out text files with LF on every platform. With Windows'
+# core.autocrlf=true, files arrive as CRLF, which changes migration
+# checksums and breaks tests that read Go source as text.
+* text=auto eol=lf
