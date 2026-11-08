@@ -1016,6 +1016,7 @@ func main() {
 		relWrite.POST("/releases/:id/actions/publish", releaseAdminH.Publish)
 		relWrite.POST("/releases/:id/actions/yank", releaseAdminH.Yank)
 		relWrite.POST("/releases/:id/actions/unyank", releaseAdminH.Unyank)
+		relWrite.POST("/releases/:id/actions/promote", releaseAdminH.Promote)
 
 		// ─── Release signing keys (per product) ───
 		admin.POST("/products/:id/signing-key", releaseSigningH.Generate)

@@ -16,6 +16,7 @@ var (
 	ErrReleaseAlreadyExists  = errors.New("release with same product/version already exists")
 	ErrReleaseNotPublishable = errors.New("release is not in a publishable state")
 	ErrReleaseNotYankable    = errors.New("release is not in a yankable state")
+	ErrReleaseNotPromotable  = errors.New("release is not in a promotable state")
 	// ErrReleaseNotDeletable: only DRAFT releases can be hard-deleted.
 	// Published / yanked stay in the DB so audit trail is preserved.
 	ErrReleaseNotDeletable = errors.New("only draft releases can be deleted")
@@ -37,6 +38,7 @@ var (
 // ReleaseFilter narrows ListReleases queries.
 type ReleaseFilter struct {
 	ProductID string
+	Version   string
 	Channel   string
 	Status    string
 	Limit     int
@@ -150,6 +152,9 @@ func (s *Store) CountReleases(ctx context.Context, f ReleaseFilter) (int, error)
 func applyReleaseFilters(q *bun.SelectQuery, f ReleaseFilter) *bun.SelectQuery {
 	if f.ProductID != "" {
 		q = q.Where("release.product_id = ?", f.ProductID)
+	}
+	if f.Version != "" {
+		q = q.Where("release.version = ?", f.Version)
 	}
 	if f.Channel != "" {
 		q = q.Where("release.channel = ?", f.Channel)
@@ -298,6 +303,26 @@ func (s *Store) UnyankRelease(ctx context.Context, id string) error {
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return s.classifyReleaseUpdateMiss(ctx, id, ErrReleaseNotYankable)
+	}
+	return nil
+}
+
+// PromoteRelease moves a published release from one channel to another.
+// fromChannel makes this a compare-and-swap: a yank or another promotion
+// that lands first turns it into ErrReleaseNotPromotable.
+//
+// published_at moves too, because it means "when this audience got it":
+// feeds order by it and render it as the item's date.
+func (s *Store) PromoteRelease(ctx context.Context, id, fromChannel, toChannel string) error {
+	res, err := s.DB.NewUpdate().Model((*model.Release)(nil)).
+		Set("channel = ?, published_at = now(), updated_at = now()", toChannel).
+		Where("id = ? AND status = ? AND channel = ?", id, model.ReleaseStatusPublished, fromChannel).
+		Exec(ctx)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return s.classifyReleaseUpdateMiss(ctx, id, ErrReleaseNotPromotable)
 	}
 	return nil
 }

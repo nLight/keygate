@@ -29,6 +29,7 @@ import (
 //	POST   /admin/releases/:id/actions/publish          Publish (signs all artifacts)
 //	POST   /admin/releases/:id/actions/yank             Yank
 //	POST   /admin/releases/:id/actions/unyank           Unyank
+//	POST   /admin/releases/:id/actions/promote          Move to a more stable channel
 //
 // Nested artifact endpoints validate that :aid belongs to :id — a request
 // for a real artifact ID under the wrong release returns 404, not the
@@ -343,6 +344,35 @@ func (h *ReleaseAdminHandler) Unyank(c *gin.Context) {
 	response.OK(c, rel)
 }
 
+// POST /api/v1/admin/releases/:id/actions/promote
+//
+// Body: { channel }
+func (h *ReleaseAdminHandler) Promote(c *gin.Context) {
+	id := c.Param("id")
+	if !h.checkReleaseScope(c, id) {
+		return
+	}
+	var req struct {
+		Channel string `json:"channel" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "channel is required")
+		return
+	}
+
+	rel, from, err := h.svc.Promote(c.Request.Context(), id, req.Channel)
+	if err != nil {
+		writeAppErr(c, err)
+		return
+	}
+	h.store.Audit(c.Request.Context(), &model.AuditLog{
+		Entity: "release", EntityID: id, Action: "promoted",
+		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(),
+		Changes: map[string]any{"version": rel.Version, "from_channel": from, "to_channel": rel.Channel},
+	})
+	response.OK(c, rel)
+}
+
 // ─── Update / Delete ───
 
 // PATCH /api/v1/admin/releases/:id
@@ -350,9 +380,9 @@ func (h *ReleaseAdminHandler) Unyank(c *gin.Context) {
 // Body: { name?, release_notes? }
 //
 // Only display fields are mutable post-create. version / channel /
-// status / artifacts are immutable from this endpoint — version &
-// channel are part of the release identity (carve a new release if you
-// need to change them); status moves through dedicated action endpoints.
+// status / artifacts are immutable from this endpoint — version is part
+// of the release identity (carve a new release if you need to change it);
+// channel and status move through dedicated action endpoints.
 func (h *ReleaseAdminHandler) Update(c *gin.Context) {
 	id := c.Param("id")
 	var req struct {
@@ -494,6 +524,7 @@ func (h *ReleaseAdminHandler) List(c *gin.Context) {
 
 	filter := store.ReleaseFilter{
 		ProductID: productID,
+		Version:   c.Query("version"),
 		Channel:   channel,
 		Status:    status,
 		Limit:     limit,

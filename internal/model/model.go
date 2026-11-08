@@ -573,6 +573,7 @@ const (
 	EventReleasePublished  = "release.published"
 	EventReleaseYanked     = "release.yanked"
 	EventReleaseUnyanked   = "release.unyanked"
+	EventReleasePromoted   = "release.promoted"
 )
 
 // ─── Release (logical release event) ───

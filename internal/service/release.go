@@ -641,6 +641,58 @@ func (s *ReleaseService) Unyank(ctx context.Context, releaseID string) (*model.R
 	return rel, nil
 }
 
+// Promote moves a published release to a more stable channel and returns
+// it with the channel it left. The artifacts stay exactly as published:
+// their signatures cover the bytes and not the channel, so a build that
+// proved itself on beta reaches stable without being rebuilt or re-signed.
+func (s *ReleaseService) Promote(ctx context.Context, releaseID, channel string) (*model.Release, string, error) {
+	if !model.IsValidReleaseChannel(channel) {
+		return nil, "", apperr.New(400, "INVALID_CHANNEL", ErrReleaseInvalidChannel.Error())
+	}
+	rel, err := s.store.FindReleaseByID(ctx, releaseID)
+	if err != nil {
+		if errors.Is(err, store.ErrReleaseNotFound) {
+			return nil, "", apperr.New(404, "RELEASE_NOT_FOUND", "release not found")
+		}
+		return nil, "", apperr.Internal(err)
+	}
+	if err := validatePromotion(rel, channel); err != nil {
+		return nil, "", err
+	}
+	from := rel.Channel
+	if err := s.store.PromoteRelease(ctx, releaseID, from, channel); err != nil {
+		switch {
+		case errors.Is(err, store.ErrReleaseNotFound):
+			return nil, "", apperr.New(404, "RELEASE_NOT_FOUND", "release not found")
+		case errors.Is(err, store.ErrReleaseNotPromotable):
+			return nil, "", apperr.New(409, "NOT_PROMOTABLE", "release changed while it was being promoted; check it and retry")
+		default:
+			return nil, "", apperr.Internal(err)
+		}
+	}
+	rel, err = s.store.FindReleaseByID(ctx, releaseID)
+	if err != nil {
+		return nil, "", apperr.Internal(err)
+	}
+	s.dispatchWebhook(ctx, rel, model.EventReleasePromoted)
+	return rel, from, nil
+}
+
+// validatePromotion allows only moves that widen a published release's
+// audience. Narrowing is refused because it cannot take the build back:
+// clients that installed it keep it, and Sparkle never downgrades them.
+// Yank is the tool for pulling a release.
+func validatePromotion(rel *model.Release, channel string) error {
+	if rel.Status != model.ReleaseStatusPublished {
+		return apperr.New(409, "NOT_PROMOTABLE", "only published releases can be promoted")
+	}
+	if channel == rel.Channel || !slices.Contains(channelFallbackChain(rel.Channel), channel) {
+		return apperr.New(409, "CHANNEL_NOT_WIDER",
+			fmt.Sprintf("a %s release can only be promoted to a more stable channel, not %s", rel.Channel, channel))
+	}
+	return nil
+}
+
 // DeleteDraft removes a draft release + all its artifacts (CASCADE) +
 // cleans up storage objects best-effort.
 func (s *ReleaseService) DeleteDraft(ctx context.Context, releaseID string) error {
