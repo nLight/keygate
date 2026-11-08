@@ -7,7 +7,7 @@ COPY web/ .
 RUN bun run build
 
 # ── Build backend ──
-FROM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS backend
+FROM golang:1.26.10-alpine@sha256:87c65a688975c0b1d4585d204874c45ca78354670e3a5f11368c5a492303d696 AS backend
 RUN apk add --no-cache git
 WORKDIR /app
 COPY go.mod go.sum ./
@@ -25,7 +25,7 @@ RUN CGO_ENABLED=0 go build -trimpath \
     -o /keygate ./cmd/server
 
 # ── Runtime ──
-FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
+FROM alpine:3.23@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2
 RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -S -g 10001 keygate \
     && adduser -S -D -H -u 10001 -G keygate keygate
