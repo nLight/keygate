@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/uptrace/bun"
+
 	"github.com/tabloy/keygate/internal/model"
 )
 
@@ -238,39 +240,71 @@ func (s *Store) FindLicenseByID(ctx context.Context, id string) (*model.License,
 		Scan(ctx)
 }
 
+// ErrLicenseNotFound: no licence has the id given.
+var ErrLicenseNotFound = errors.New("license not found")
+
+// ErrLicenseNotSuspendable refuses to suspend a licence that is not in
+// use: suspending a revoked, expired or canceled licence would let a
+// later reinstate turn it active again.
+var ErrLicenseNotSuspendable = errors.New("only an active, trialing or past-due license can be suspended")
+
+// RevokeLicense pulls access in one transaction: the status, its
+// devices and floating sessions, and the linked subscription row go
+// together, so a failure part-way cannot leave a revoked licence with
+// live devices or a usable one without them.
 func (s *Store) RevokeLicense(ctx context.Context, id string) error {
-	_, _ = s.DB.NewDelete().Model((*model.Activation)(nil)).Where("license_id = ?", id).Exec(ctx)
-	now := time.Now()
-	// Only stamp the first revocation: a repeated call must not move the
-	// date, which is the record of when access was actually pulled.
-	res, err := s.DB.NewUpdate().Model((*model.License)(nil)).
-		Set("status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?", model.StatusRevoked, now, now).
-		Where("id = ?", id).Exec(ctx)
-	if err != nil {
+	return s.DB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		now := time.Now()
+		// Only stamp the first revocation: a repeated call must not move the
+		// date, which is the record of when access was actually pulled.
+		res, err := tx.NewUpdate().Model((*model.License)(nil)).
+			Set("status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?", model.StatusRevoked, now, now).
+			Where("id = ?", id).Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrLicenseNotFound
+		}
+		if _, err := tx.NewDelete().Model((*model.Activation)(nil)).Where("license_id = ?", id).Exec(ctx); err != nil {
+			return err
+		}
+		if _, err := tx.NewDelete().Model((*model.FloatingSession)(nil)).Where("license_id = ?", id).Exec(ctx); err != nil {
+			return err
+		}
+		_, err = tx.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now() WHERE license_id = ?`, model.StatusRevoked, id).Exec(ctx)
 		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("license not found")
-	}
-	_, _ = s.DB.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now() WHERE license_id = ?`, model.StatusRevoked, id).Exec(ctx)
-	return nil
+	})
 }
 
+// SuspendLicense suspends a licence in use. It refuses one that is
+// revoked, expired or canceled (ErrLicenseNotSuspendable): reinstate
+// accepts a suspended licence, so revoke → suspend → reinstate would
+// otherwise bring a revoked licence back.
 func (s *Store) SuspendLicense(ctx context.Context, id string) error {
-	now := time.Now()
-	res, err := s.DB.NewUpdate().Model((*model.License)(nil)).
-		Set("status = ?, suspended_at = ?, updated_at = ?", model.StatusSuspended, now, now).
-		Where("id = ?", id).Exec(ctx)
-	if err != nil {
+	return s.DB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		now := time.Now()
+		res, err := tx.NewUpdate().Model((*model.License)(nil)).
+			Set("status = ?, suspended_at = ?, updated_at = ?", model.StatusSuspended, now, now).
+			Where("id = ?", id).
+			Where("status IN (?)", bun.In([]string{model.StatusActive, model.StatusTrialing, model.StatusPastDue})).
+			Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			var exists bool
+			if err := tx.NewRaw("SELECT EXISTS (SELECT 1 FROM licenses WHERE id = ?)", id).Scan(ctx, &exists); err != nil {
+				return err
+			}
+			if exists {
+				return ErrLicenseNotSuspendable
+			}
+			return ErrLicenseNotFound
+		}
+		_, err = tx.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now() WHERE license_id = ?`, model.StatusSuspended, id).Exec(ctx)
 		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("license not found")
-	}
-	_, _ = s.DB.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now() WHERE license_id = ?`, model.StatusSuspended, id).Exec(ctx)
-	return nil
+	})
 }
 
 func (s *Store) ReinstateLicense(ctx context.Context, id string) error {

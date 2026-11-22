@@ -1041,7 +1041,12 @@ func (h *AdminHandler) RevokeLicense(c *gin.Context) {
 	// reachable — revoke is how a merchant stops abuse — so the local
 	// write happens first and is never rolled back by a provider failure.
 	if err := h.Store.RevokeLicense(c, id); err != nil {
-		response.NotFound(c, err.Error())
+		if errors.Is(err, store.ErrLicenseNotFound) {
+			response.NotFound(c, err.Error())
+			return
+		}
+		slog.Error("revoke license failed", "license_id", id, "error", err)
+		response.Internal(c)
 		return
 	}
 
@@ -1098,9 +1103,11 @@ func (h *AdminHandler) RefundLicense(c *gin.Context) {
 		providerResult = "stripe_subscription_canceled"
 	}
 
-	// Mark the license as revoked
-	lic.Status = model.StatusRevoked
-	if err := h.Store.UpdateLicenseAndSubscription(c, lic, "status"); err != nil {
+	// Revoke the same way the revoke action does: status, revoked_at,
+	// devices, floating sessions and the subscription row together. A
+	// bare status write left the refunded licence's devices in place.
+	if err := h.Store.RevokeLicense(c, id); err != nil {
+		slog.Error("revoke refunded license failed", "license_id", id, "error", err)
 		response.Internal(c)
 		return
 	}
@@ -1126,7 +1133,16 @@ func (h *AdminHandler) SuspendLicense(c *gin.Context) {
 		return
 	}
 	if err := h.Store.SuspendLicense(c, id); err != nil {
-		response.NotFound(c, err.Error())
+		if errors.Is(err, store.ErrLicenseNotSuspendable) {
+			response.Conflict(c, "LICENSE_NOT_SUSPENDABLE", err.Error(), nil)
+			return
+		}
+		if errors.Is(err, store.ErrLicenseNotFound) {
+			response.NotFound(c, err.Error())
+			return
+		}
+		slog.Error("suspend license failed", "license_id", id, "error", err)
+		response.Internal(c)
 		return
 	}
 	h.Store.Audit(c, &model.AuditLog{
