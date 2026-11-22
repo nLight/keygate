@@ -2,6 +2,7 @@ package apperr
 
 import (
 	"net/mail"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -46,6 +47,11 @@ func ValidateEmail(email string) *AppError {
 	if !strings.Contains(addr.Address, "@") {
 		return BadRequest("invalid email format")
 	}
+	// ParseAddress also accepts "Name <a@b.c>" and padding; the stored
+	// value must be the bare address, or no lookup would ever match it.
+	if addr.Address != email {
+		return BadRequest("invalid email format: use a bare address such as name@example.com")
+	}
 	return nil
 }
 
@@ -89,6 +95,11 @@ func ValidateURL(value string) *AppError {
 	}
 	if !strings.HasPrefix(value, "https://") && !strings.HasPrefix(value, "http://") {
 		return &AppError{Status: 400, Code: "INVALID_INPUT", Message: "url must start with https:// or http://"}
+	}
+	// "http://" and "https:///hook" pass the prefix check but name no host,
+	// so a webhook saved with one could never be delivered.
+	if u, err := url.Parse(value); err != nil || u.Hostname() == "" {
+		return &AppError{Status: 400, Code: "INVALID_INPUT", Message: "url must include a host, such as https://example.com/hook"}
 	}
 	return nil
 }

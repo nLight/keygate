@@ -1,6 +1,9 @@
 package apperr
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestValidateEmail(t *testing.T) {
 	tests := []struct {
@@ -15,6 +18,8 @@ func TestValidateEmail(t *testing.T) {
 		{"not-email", false},
 		{"@no-local.com", false},
 		{"no-at-sign", false},
+		{"Alice <alice@example.com>", false},          // display-name form
+		{" alice@example.com ", false},                // padded
 		{string(make([]byte, 255)) + "@x.com", false}, // too long
 	}
 	for _, tt := range tests {
@@ -96,6 +101,15 @@ func TestValidateURL(t *testing.T) {
 		{"example.com", false},
 		{"ftp://files.com", false},
 		{"not-a-url", false},
+		{"https://", false},
+		{"http://", false},
+		{"https:///hook", false},
+		{"http://:8080/hook", false},
+		{"https://?token=x", false},
+		{"http://user@/hook", false},
+		{"https://exa mple.com/hook", false},
+		{"https://[::1]:8080/hook", true},
+		{"https://user:pass@example.com:8443/hook?x=1", true},
 	}
 	for _, tt := range tests {
 		err := ValidateURL(tt.input)
@@ -104,6 +118,45 @@ func TestValidateURL(t *testing.T) {
 		}
 		if !tt.ok && err == nil {
 			t.Errorf("ValidateURL(%q) = nil, want error", tt.input)
+		}
+	}
+}
+
+func TestValidateSemver(t *testing.T) {
+	tests := []struct {
+		input string
+		ok    bool
+	}{
+		{"1.0.0", true},
+		{"0.0.1", true},
+		{"1.2.3-alpha", true},
+		{"1.2.3-alpha.1", true},
+		{"1.2.3-0.3.7", true},
+		{"1.2.3-x.7.z.92", true},
+		{"1.2.3+20130313144700", true},
+		{"1.2.3-beta+exp.sha.5114f85", true},
+		{"", false},
+		{"1.0.0-" + strings.Repeat("a", 58), true}, // 64 characters, the limit
+		{"1.0.0-" + strings.Repeat("a", 59), false},
+		{"v1.0.0", false},
+		{"1.0", false},
+		{"1", false},
+		{"01.0.0", false},
+		{"1.02.0", false},
+		{"1.0.03", false},
+		{"1.2.3-", false},
+		{"1.2.3+", false},
+		{"1.2.3-01", false},       // a numeric pre-release with a leading zero
+		{"1.2.3-alpha..1", false}, // an empty pre-release identifier
+		{"not-a-version", false},
+	}
+	for _, tt := range tests {
+		err := ValidateSemver(tt.input)
+		if tt.ok && err != nil {
+			t.Errorf("ValidateSemver(%q) = error %q, want nil", tt.input, err.Message)
+		}
+		if !tt.ok && err == nil {
+			t.Errorf("ValidateSemver(%q) = nil, want error", tt.input)
 		}
 	}
 }

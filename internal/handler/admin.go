@@ -914,6 +914,9 @@ func (h *AdminHandler) CreateLicense(c *gin.Context) {
 		return
 	}
 
+	// Sign-in and portal lookups use the trimmed, lower-cased address; a
+	// license stored any other way would never show up for its owner.
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 	if appErr := apperr.ValidateEmail(req.Email); appErr != nil {
 		response.BadRequest(c, appErr.Message)
 		return
