@@ -30,7 +30,8 @@ type fakeSubscriptionItems struct {
 	subID      string
 	periodEnds []int64
 	pageSize   int
-	status     int // non-200 fails every request
+	status     int    // non-200 fails every request
+	subStatus  string // served for GET /v1/subscriptions/{subID} when set
 
 	mu       sync.Mutex
 	requests int
@@ -41,6 +42,10 @@ func (f *fakeSubscriptionItems) ServeHTTP(w http.ResponseWriter, r *http.Request
 	defer f.mu.Unlock()
 	f.requests++
 	w.Header().Set("Content-Type", "application/json")
+	if f.subStatus != "" && r.Method == http.MethodGet && r.URL.Path == "/v1/subscriptions/"+f.subID {
+		_, _ = fmt.Fprintf(w, `{"id":%q,"object":"subscription","status":%q}`, f.subID, f.subStatus)
+		return
+	}
 	if r.Method != http.MethodGet || r.URL.Path != "/v1/subscription_items" {
 		w.WriteHeader(http.StatusNotFound)
 		return

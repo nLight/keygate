@@ -285,7 +285,7 @@ func (s *Store) SuspendLicense(ctx context.Context, id string) error {
 	return s.DB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		now := time.Now()
 		res, err := tx.NewUpdate().Model((*model.License)(nil)).
-			Set("status = ?, suspended_at = ?, updated_at = ?", model.StatusSuspended, now, now).
+			Set("status = ?, suspended_at = ?, suspended_by = ?, updated_at = ?", model.StatusSuspended, now, model.SuspendedByAdmin, now).
 			Where("id = ?", id).
 			Where("status IN (?)", bun.In([]string{model.StatusActive, model.StatusTrialing, model.StatusPastDue})).
 			Exec(ctx)
@@ -309,7 +309,7 @@ func (s *Store) SuspendLicense(ctx context.Context, id string) error {
 
 func (s *Store) ReinstateLicense(ctx context.Context, id string) error {
 	res, err := s.DB.NewUpdate().Model((*model.License)(nil)).
-		Set("status = ?, suspended_at = NULL, canceled_at = NULL, updated_at = ?", model.StatusActive, time.Now()).
+		Set("status = ?, suspended_at = NULL, suspended_by = NULL, canceled_at = NULL, updated_at = ?", model.StatusActive, time.Now()).
 		Where("id = ?", id).
 		Where("status IN ('suspended', 'expired', 'canceled')").
 		Exec(ctx)

@@ -305,6 +305,10 @@ type License struct {
 	CanceledAt  *time.Time `json:"canceled_at,omitempty"`
 	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
 	SuspendedAt *time.Time `json:"suspended_at,omitempty"`
+	// SuspendedBy says who suspended it: SuspendedByAdmin, which only an
+	// operator lifts, or SuspendedByStripe (a paused subscription), which
+	// a resume lifts. Empty when not suspended.
+	SuspendedBy string `bun:",nullzero" json:"suspended_by,omitempty"`
 	// PastDueAt anchors the dunning-email ladder. Set by the
 	// payment-failed handler when the license first enters past_due;
 	// cleared on recovery / cancellation. Reading lic.UpdatedAt as
@@ -337,6 +341,12 @@ const (
 	StatusExpired   = "expired"
 	StatusSuspended = "suspended"
 	StatusRevoked   = "revoked"
+)
+
+// Who suspended a licence (License.SuspendedBy).
+const (
+	SuspendedByAdmin  = "admin"
+	SuspendedByStripe = "stripe"
 )
 
 // ─── Activation ───

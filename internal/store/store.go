@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -613,6 +614,90 @@ func (s *Store) UpdateLicenseAndSubscription(ctx context.Context, lic *model.Lic
 	}
 
 	return tx.Commit()
+}
+
+// ErrLicenseRestricted: a write driven by a Stripe event was refused
+// because the licence is revoked, suspended by an operator, or ended in
+// a way the event may not undo. Not an error to retry.
+var ErrLicenseRestricted = errors.New("license is revoked, suspended by an operator or ended")
+
+// UpdateLicenseFromWebhook is UpdateLicenseAndSubscription for a write a
+// Stripe event drives. The licence's own state is checked in the write,
+// under the row lock, so a suspension or revocation made a moment
+// earlier is never overwritten: payment can give back what non-payment
+// took, never what an operator took, nor revive a subscription that
+// ended. In particular revoking a licence cancels its subscription, and
+// the customer.subscription.deleted that follows must not turn the
+// revoked licence into a canceled one, usable until valid_until.
+// (A simplified port of upstream's guard in updateLicenseAndSubscriptionIn.)
+//
+// The write also only lands while the licence still belongs to the
+// subscription the event is about. Returns ErrLicenseRestricted when
+// refused.
+//
+// reviveCanceled lets a live status replace "canceled": only for a
+// caller that has just read the subscription from Stripe and found it
+// live (an "unpaid" subscription, mapped to canceled, that was then
+// paid). An event payload is history and may predate the end.
+func (s *Store) UpdateLicenseFromWebhook(ctx context.Context, lic *model.License, reviveCanceled bool, cols ...string) error {
+	return s.DB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		lic.UpdatedAt = time.Now()
+		allCols := append(append([]string{}, cols...), "updated_at")
+		if lic.Status == model.StatusSuspended && slices.Contains(cols, "status") {
+			lic.SuspendedBy = model.SuspendedByStripe
+			allCols = append(allCols, "suspended_by")
+		} else if lic.Status != model.StatusSuspended && slices.Contains(cols, "status") {
+			lic.SuspendedBy = ""
+			allCols = append(allCols, "suspended_by")
+		}
+		q := tx.NewUpdate().Model(lic).Column(allCols...).WherePK().
+			Where("status <> ?", model.StatusRevoked)
+		if lic.StripeSubscriptionID != "" {
+			q = q.Where("stripe_subscription_id = ?", lic.StripeSubscriptionID)
+		}
+		adminSuspended := bun.Safe("(status = 'suspended' AND COALESCE(suspended_by, 'admin') <> 'stripe')")
+		if !slices.Contains(cols, "status") {
+			if slices.Contains(cols, "valid_until") {
+				q = q.Where("status NOT IN (?)", bun.In([]string{model.StatusCanceled, model.StatusExpired}))
+			}
+		} else {
+			switch lic.Status {
+			case model.StatusActive, model.StatusTrialing, model.StatusPastDue:
+				q = q.Where("NOT ?", adminSuspended)
+				// Stripe never brings a deleted subscription back.
+				if !reviveCanceled {
+					q = q.Where("status <> ?", model.StatusCanceled)
+				}
+				// Still unpaid is no reason to bring back a licence that
+				// expired for want of payment; only payment does.
+				if lic.Status == model.StatusPastDue {
+					q = q.Where("NOT (status = ? AND past_due_at IS NOT NULL)", model.StatusExpired)
+				}
+			case model.StatusSuspended:
+				// A pause must not replace an operator's suspension (a
+				// resume would then lift it), nor reach an ended licence.
+				q = q.Where("NOT ?", adminSuspended).
+					Where("status NOT IN (?)", bun.In([]string{model.StatusCanceled, model.StatusExpired}))
+			case model.StatusCanceled, model.StatusExpired:
+				// The subscription ended: an operator's suspension stays.
+				q = q.Where("NOT ?", adminSuspended)
+			}
+		}
+		res, err := q.Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrLicenseRestricted
+		}
+		if slices.Contains(cols, "status") {
+			if _, err := tx.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now()
+				WHERE license_id = ? AND status != ?`, lic.Status, lic.ID, lic.Status).Exec(ctx); err != nil {
+				return fmt.Errorf("sync subscription status: %w", err)
+			}
+		}
+		return nil
+	})
 }
 
 // SetLiveLicenseValidUntil moves valid_until on a licence that has not
