@@ -113,3 +113,70 @@ func TestChangePlan_AlwaysProrates(t *testing.T) {
 		t.Fatalf("proration_behavior sent to Stripe = %v, want create_prorations both times", behaviours)
 	}
 }
+
+// Cancel at period end with no cancel_at in Stripe's answer leaves
+// valid_until alone (the webhook sets it); it used to become 1970-01-01,
+// ending the licence at once.
+func TestCancelAtPeriodEndWithoutCancelAtKeepsValidUntil(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	s, err := store.New(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.RunMigrations("../../db/migrations"); err != nil {
+		t.Fatal(err)
+	}
+	s.LicenseKeyAEAD = keycrypto.MustDeriveAEAD(make([]byte, 32), "license-key")
+	ctx := context.Background()
+	suffix := time.Now().Format("150405.000000")
+	prod := &model.Product{Name: "Cancel", Slug: "cancel-" + suffix, Type: "saas"}
+	if err := s.CreateProduct(ctx, prod); err != nil {
+		t.Fatal(err)
+	}
+	plan := &model.Plan{ProductID: prod.ID, Name: "p", Slug: "c-" + suffix, LicenseType: "subscription", LicenseModel: "standard", Active: true}
+	if err := s.CreatePlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	subID := "sub_cn_" + suffix
+	until := time.Now().Add(20 * 24 * time.Hour).Truncate(time.Second)
+	lic := &model.License{ProductID: prod.ID, PlanID: plan.ID, Email: "cancel-" + suffix + "@example.com",
+		LicenseKey: "KEY-cn-" + suffix, Status: "active", PaymentProvider: "stripe", StripeSubscriptionID: subID, ValidUntil: &until}
+	if err := s.CreateLicense(ctx, lic); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"id":%q,"object":"subscription","status":"active","cancel_at_period_end":true,"cancel_at":0}`, subID))
+	}))
+	t.Cleanup(srv.Close)
+	prevKey := stripe.Key
+	stripe.Key = "sk_test_fake"
+	stripe.SetBackend(stripe.APIBackend, stripe.GetBackendWithConfig(stripe.APIBackend, &stripe.BackendConfig{
+		URL: stripe.String(srv.URL), MaxNetworkRetries: stripe.Int64(0),
+		LeveledLogger: &stripe.LeveledLogger{Level: stripe.LevelNull},
+	}))
+	t.Cleanup(func() { stripe.Key = prevKey; stripe.SetBackend(stripe.APIBackend, nil) })
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/portal/subscription/cancel",
+		bytes.NewBufferString(fmt.Sprintf(`{"license_id":%q}`, lic.ID)))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("email", lic.Email)
+	(&StripeHandler{Store: s}).CancelSubscription(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("cancel = %d: %s", w.Code, w.Body.String())
+	}
+	got, err := s.FindLicenseByID(ctx, lic.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ValidUntil == nil || !got.ValidUntil.Equal(until) {
+		t.Errorf("valid_until = %v, want unchanged %v", got.ValidUntil, until)
+	}
+}

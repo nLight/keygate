@@ -119,3 +119,34 @@ func TestNewDeviceOrSessionRefusedOnStoppedLicense(t *testing.T) {
 		}
 	}
 }
+
+// A date-only write does not push valid_until out on a licence that has
+// already ended; on a live one it does.
+func TestSetLiveLicenseValidUntil(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	later := time.Now().Add(30 * 24 * time.Hour).Truncate(time.Second)
+
+	live := createTestLicense(t, s, ctx)
+	if err := s.SetLiveLicenseValidUntil(ctx, live.ID, later); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.FindLicenseByID(ctx, live.ID)
+	if got.ValidUntil == nil || !got.ValidUntil.Equal(later) {
+		t.Errorf("live licence valid_until = %v, want %v", got.ValidUntil, later)
+	}
+
+	ended := createTestLicense(t, s, ctx)
+	now := time.Now().Truncate(time.Second)
+	if _, err := s.DB.NewRaw("UPDATE licenses SET status = ?, valid_until = ? WHERE id = ?", model.StatusCanceled, now, ended.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetLiveLicenseValidUntil(ctx, ended.ID, later); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.FindLicenseByID(ctx, ended.ID)
+	if got.ValidUntil == nil || !got.ValidUntil.Equal(now) {
+		t.Errorf("canceled licence valid_until moved to %v, want %v", got.ValidUntil, now)
+	}
+}

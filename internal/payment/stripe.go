@@ -1120,7 +1120,12 @@ func (h *StripeHandler) CancelSubscription(c *gin.Context) {
 		lic.Status = model.StatusCanceled
 		lic.CanceledAt = &now
 		lic.ValidUntil = &now
-		_ = h.Store.UpdateLicense(c, lic, "status", "canceled_at", "valid_until")
+		// With the subscription row, as every other status write: the
+		// customer.subscription.deleted webhook that follows repeats it
+		// if this one fails, so a failure is logged, not answered.
+		if err := h.Store.UpdateLicenseAndSubscription(c, lic, "status", "canceled_at", "valid_until"); err != nil {
+			slog.Error("stripe: immediate cancel not recorded locally", "license_id", lic.ID, "error", err)
+		}
 	} else {
 		sub, updateErr := subscription.Update(lic.StripeSubscriptionID, &stripe.SubscriptionParams{
 			CancelAtPeriodEnd: stripe.Bool(true),
@@ -1129,10 +1134,18 @@ func (h *StripeHandler) CancelSubscription(c *gin.Context) {
 			response.Internal(c)
 			return
 		}
-		// Set ValidUntil to when Stripe will cancel the subscription
-		periodEnd := time.Unix(sub.CancelAt, 0)
-		lic.ValidUntil = &periodEnd
-		_ = h.Store.UpdateLicense(c, lic, "valid_until")
+		// Set ValidUntil to when Stripe will cancel the subscription.
+		// Without that date in the answer (cancel_at 0) the
+		// subscription.updated webhook sets it: time.Unix(0) would end
+		// the licence at once, on 1970-01-01. The write is guarded so it
+		// cannot push the date back out on a licence that has already
+		// ended (an immediate cancel or revoke racing this one).
+		if sub.CancelAt > 0 {
+			periodEnd := time.Unix(sub.CancelAt, 0)
+			if err := h.Store.SetLiveLicenseValidUntil(c, lic.ID, periodEnd); err != nil {
+				slog.Warn("stripe: cancel-at-period-end valid_until not written", "license_id", lic.ID, "error", err)
+			}
+		}
 	}
 
 	h.Store.Audit(c, &model.AuditLog{

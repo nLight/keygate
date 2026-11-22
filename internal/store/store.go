@@ -600,16 +600,33 @@ func (s *Store) UpdateLicenseAndSubscription(ctx context.Context, lic *model.Lic
 		return err
 	}
 
-	// Sync subscription status if one exists
+	// Sync the subscription row's status. A licence with no subscription
+	// row updates nothing, which is not an error; a failed statement is:
+	// it aborts the transaction, so carrying on would only fail at
+	// Commit, or (before this returned it) report success for a write
+	// Postgres had rolled back. (Upstream 1423918.)
 	if _, err := tx.NewRaw(`
 		UPDATE subscriptions SET status = ?, updated_at = now()
 		WHERE license_id = ? AND status != ?
 	`, lic.Status, lic.ID, lic.Status).Exec(ctx); err != nil {
-		// Non-fatal: subscription may not exist
-		slog.Warn("sync subscription status failed", "license_id", lic.ID, "error", err)
+		return fmt.Errorf("sync subscription status: %w", err)
 	}
 
 	return tx.Commit()
+}
+
+// SetLiveLicenseValidUntil moves valid_until on a licence that has not
+// ended. A date-only write must not push the date out on a canceled,
+// expired or revoked licence: canceled access lasts until valid_until,
+// so cancel-at-period-end racing an immediate cancel would restore it
+// until the period end. (Upstream 9b64ba9, #125.)
+func (s *Store) SetLiveLicenseValidUntil(ctx context.Context, id string, validUntil time.Time) error {
+	_, err := s.DB.NewUpdate().Model((*model.License)(nil)).
+		Set("valid_until = ?, updated_at = now()", validUntil).
+		Where("id = ?", id).
+		Where("status NOT IN (?)", bun.In([]string{model.StatusCanceled, model.StatusExpired, model.StatusRevoked})).
+		Exec(ctx)
+	return err
 }
 
 func (s *Store) ListLicensesByEmail(ctx context.Context, email string) ([]*model.License, error) {
