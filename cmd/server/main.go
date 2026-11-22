@@ -13,9 +13,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -691,11 +693,8 @@ func main() {
 				return
 			}
 
-			// Sanitize: trim whitespace, strip HTML tags, limit length
-			name := strings.TrimSpace(req.Name)
-			// Strip HTML tags to prevent XSS
-			name = stripHTMLTags(name)
-			if len(name) > 100 {
+			name, ok := profileName(req.Name)
+			if !ok {
 				response.BadRequest(c, "name too long (max 100 characters)")
 				return
 			}
@@ -1076,24 +1075,33 @@ func main() {
 	log.Println("Server exited gracefully")
 }
 
-// stripHTMLTags removes all HTML tags from a string to prevent XSS.
-func stripHTMLTags(s string) string {
-	var result strings.Builder
-	inTag := false
-	for _, r := range s {
-		if r == '<' {
-			inTag = true
-			continue
-		}
-		if r == '>' {
-			inTag = false
-			continue
-		}
-		if !inTag {
-			result.WriteRune(r)
-		}
+var htmlTagPattern = regexp.MustCompile(`(?i)<[/!]?[a-z][^<>]*>|<!--[\s\S]*?-->`)
+
+// profileName is the name a profile update stores: trimmed, at most 100
+// characters (runes, not bytes: a Cyrillic or CJK name was cut at half
+// or a third of that), with HTML tags stripped. ok is false when longer.
+//
+// The length is checked before the tags are stripped. Stripping takes a
+// pass per level of nested tags, so on an unbounded input its time grows
+// with the square of the length.
+func profileName(raw string) (name string, ok bool) {
+	name = strings.TrimSpace(raw)
+	if utf8.RuneCountInString(name) > 100 {
+		return "", false
 	}
-	return result.String()
+	return stripHTMLTags(name), true
+}
+
+// stripHTMLTags removes HTML tags from a string. A lone '<' that opens no
+// tag ("a < b", "<3") is kept; the old character scanner dropped
+// everything after it. Output is escaped where it is rendered; this is
+// defence in depth, not the XSS boundary. Callers bound its input (see
+// profileName).
+func stripHTMLTags(s string) string {
+	for htmlTagPattern.MatchString(s) {
+		s = htmlTagPattern.ReplaceAllString(s, "")
+	}
+	return s
 }
 
 // serveFrontend serves the React SPA from web/dist if it exists.
