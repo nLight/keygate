@@ -92,3 +92,33 @@ func TestInvoicePaidRevivesCanceledOnlyWhenSubscriptionIsLive(t *testing.T) {
 		}
 	}
 }
+
+// A renewal paid while an operator holds the licence suspended keeps
+// the suspension but records the paid-through date, so a reinstate
+// gives back the period that was paid for.
+func TestInvoicePaidRecordsRenewalOnAdminSuspendedLicense(t *testing.T) {
+	h, s, lic, _ := setupBasilWebhookTest(t, model.StatusActive)
+	setLicenseState(t, h, lic, model.StatusSuspended, model.SuspendedByAdmin)
+	deliverEvent(t, h, "invoice.paid", fixtureFor(t, "invoice_paid_renewal.json", lic))
+	got := reloadLicense(t, s, lic)
+	if got.Status != model.StatusSuspended {
+		t.Fatalf("status = %s, want suspended", got.Status)
+	}
+	assertValidUntil(t, got, renewalPeriodEnd)
+}
+
+// When Stripe cannot be read to confirm a canceled licence's
+// subscription is live, invoice.paid fails so Stripe retries it,
+// instead of being acknowledged with the customer left canceled.
+func TestInvoicePaidRetriesWhenSubscriptionReadFails(t *testing.T) {
+	h, s, lic, fake := setupBasilWebhookTest(t, model.StatusActive)
+	setLicenseState(t, h, lic, model.StatusCanceled, "")
+	fake.status = 503
+	w := deliverEventRaw(t, h, "invoice.paid", fixtureFor(t, "invoice_paid_renewal.json", lic))
+	if w < 500 {
+		t.Fatalf("webhook answered %d, want a 5xx so Stripe retries", w)
+	}
+	if got := reloadLicense(t, s, lic); got.Status != model.StatusCanceled {
+		t.Errorf("status = %s, want still canceled", got.Status)
+	}
+}

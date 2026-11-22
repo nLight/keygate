@@ -156,6 +156,15 @@ func setupBasilWebhookTest(t *testing.T, status string) (*StripeHandler, *store.
 // the real Webhook entry point.
 func deliverEvent(t *testing.T, h *StripeHandler, eventType string, object []byte) {
 	t.Helper()
+	if code := deliverEventRaw(t, h, eventType, object); code != http.StatusOK {
+		t.Fatalf("webhook %s: status=%d", eventType, code)
+	}
+}
+
+// deliverEventRaw is deliverEvent returning the status code instead of
+// failing on a non-200 answer.
+func deliverEventRaw(t *testing.T, h *StripeHandler, eventType string, object []byte) int {
+	t.Helper()
 	payload, err := json.Marshal(map[string]any{
 		"id":          fmt.Sprintf("evt_basil_%d", time.Now().UnixNano()),
 		"object":      "event",
@@ -177,9 +186,10 @@ func deliverEvent(t *testing.T, h *StripeHandler, eventType string, object []byt
 	req.Header.Set("Stripe-Signature", signed.Header)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
-	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "skipped") {
-		t.Fatalf("webhook %s: status=%d body=%s", eventType, w.Code, w.Body.String())
+	if strings.Contains(w.Body.String(), "skipped") {
+		t.Fatalf("webhook %s: skipped: %s", eventType, w.Body.String())
 	}
+	return w.Code
 }
 
 // fixtureFor rewrites the fixture's subscription/customer IDs to the

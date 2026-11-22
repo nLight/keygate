@@ -632,7 +632,14 @@ func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) 
 	if err != nil {
 		return err // database unavailable: let Stripe retry
 	}
-	reviveCanceled := lic.Status == model.StatusCanceled && subscriptionLiveNow(subID)
+	reviveCanceled := false
+	if lic.Status == model.StatusCanceled {
+		live, err := subscriptionLiveNow(subID)
+		if err != nil {
+			return err // Stripe unavailable: let Stripe retry the payment event
+		}
+		reviveCanceled = live
+	}
 	wasPastDue := lic.Status == model.StatusPastDue
 	// Capture the episode anchor BEFORE the write clears it.
 	// Without this, notifyPaymentRecovered would always see a nil
@@ -728,16 +735,23 @@ func (h *StripeHandler) webhookWrite(ctx context.Context, lic *model.License, ev
 // subscriptionLiveNow reads the subscription from Stripe and reports
 // whether it is live (active, trialing or past due). Used before a
 // payment event may revive a canceled licence.
-func subscriptionLiveNow(subID string) bool {
+//
+// A failed read is returned as an error, not as "not live": a payment
+// event that cannot tell must be retried, or a paying customer whose
+// "unpaid" subscription recovered stays canceled.
+func subscriptionLiveNow(subID string) (bool, error) {
 	sub, err := subscription.Get(subID, nil)
-	if err != nil || sub == nil {
-		return false
+	if err != nil {
+		return false, fmt.Errorf("read subscription %s: %w", subID, err)
+	}
+	if sub == nil {
+		return false, nil
 	}
 	switch sub.Status {
 	case stripe.SubscriptionStatusActive, stripe.SubscriptionStatusTrialing, stripe.SubscriptionStatusPastDue:
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
 func applySubscriptionStatus(lic *model.License, status string) []string {
@@ -821,7 +835,17 @@ func (h *StripeHandler) onSubscriptionUpdated(ctx context.Context, raw json.RawM
 	}
 	// A payload saying "live" may predate the end; only a fresh read
 	// may bring a canceled licence back.
-	reviveCanceled := wasCanceled && lic.Status != model.StatusCanceled && subscriptionLiveNow(data.ID)
+	reviveCanceled := false
+	if wasCanceled && lic.Status != model.StatusCanceled {
+		live, err := subscriptionLiveNow(data.ID)
+		if err != nil {
+			// Not retried (order-sensitive); invoice.paid, which is
+			// retried, revives it if the subscription is live.
+			slog.Warn("stripe customer.subscription.updated: subscription read failed, canceled licence not revived",
+				"subscription_id", data.ID, "license_id", lic.ID, "error", err)
+		}
+		reviveCanceled = live
+	}
 	// Not retried: Stripe retries out of order, and an older state
 	// applied late would undo a newer one.
 	if landed, _ := h.webhookWrite(ctx, lic, "customer.subscription.updated", reviveCanceled, cols...); !landed {

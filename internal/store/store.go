@@ -640,7 +640,8 @@ var ErrLicenseRestricted = errors.New("license is revoked, suspended by an opera
 // live (an "unpaid" subscription, mapped to canceled, that was then
 // paid). An event payload is history and may predate the end.
 func (s *Store) UpdateLicenseFromWebhook(ctx context.Context, lic *model.License, reviveCanceled bool, cols ...string) error {
-	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+	restricted := false
+	err := RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
 		lic.UpdatedAt = time.Now()
 		allCols := append(append([]string{}, cols...), "updated_at")
 		if lic.Status == model.StatusSuspended && slices.Contains(cols, "status") {
@@ -688,7 +689,25 @@ func (s *Store) UpdateLicenseFromWebhook(ctx context.Context, lic *model.License
 			return err
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
-			return ErrLicenseRestricted
+			// Refused. A renewal paid while an operator holds the licence
+			// suspended still records its paid-through date, so a later
+			// reinstate gives back the period the customer paid for; the
+			// suspension itself stays.
+			if lic.ValidUntil != nil && slices.Contains(cols, "valid_until") {
+				q2 := tx.NewUpdate().Model((*model.License)(nil)).
+					Set("valid_until = ?, updated_at = now()", *lic.ValidUntil).
+					Where("id = ?", lic.ID).
+					Where("?", adminSuspended)
+				if lic.StripeSubscriptionID != "" {
+					q2 = q2.Where("stripe_subscription_id = ?", lic.StripeSubscriptionID)
+				}
+				if _, err := q2.Exec(ctx); err != nil {
+					return err
+				}
+			}
+			// Committed (the date above), then reported as refused.
+			restricted = true
+			return nil
 		}
 		if slices.Contains(cols, "status") {
 			if _, err := tx.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now()
@@ -698,6 +717,10 @@ func (s *Store) UpdateLicenseFromWebhook(ctx context.Context, lic *model.License
 		}
 		return nil
 	})
+	if err == nil && restricted {
+		return ErrLicenseRestricted
+	}
+	return err
 }
 
 // SetLiveLicenseValidUntil moves valid_until on a licence that has not
