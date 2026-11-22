@@ -529,8 +529,8 @@ func (s *LicenseService) entitlements(lic *model.License) map[string]any {
 	}
 	for _, e := range lic.Plan.Entitlements {
 		switch e.ValueType {
-		case "bool":
-			m[e.Feature] = e.Value == "true"
+		case "bool", "flag":
+			m[e.Feature] = featureEnabled(e.ValueType, e.Value)
 		default:
 			m[e.Feature] = e.Value
 		}

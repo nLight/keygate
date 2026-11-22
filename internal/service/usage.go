@@ -10,6 +10,16 @@ import (
 	"github.com/tabloy/keygate/pkg/apperr"
 )
 
+// quotaRemaining is what is left of a quota: -1 when it is unlimited (limit
+// 0), and never below 0 otherwise, so usage past a limit that was lowered
+// afterwards cannot read as unlimited (limit 10, used 11 gave -1).
+func quotaRemaining(limit, used int64) int64 {
+	if limit == 0 {
+		return -1
+	}
+	return max(limit-used, 0)
+}
+
 type UsageService struct {
 	store            *store.Store
 	webhook          *WebhookService
@@ -123,10 +133,7 @@ func (s *UsageService) RecordUsage(ctx context.Context, in RecordUsageInput) (*R
 	}
 
 	newUsed := updated.Used
-	remaining := limit - newUsed
-	if limit == 0 {
-		remaining = -1
-	}
+	remaining := quotaRemaining(limit, newUsed)
 
 	if limit > 0 && s.warningThreshold > 0 {
 		ratio := float64(newUsed) / float64(limit)
@@ -203,10 +210,7 @@ func (s *UsageService) GetQuotaStatus(ctx context.Context, licenseKey, feature, 
 		used = counter.Used
 	}
 
-	remaining := limit - used
-	if limit == 0 {
-		remaining = -1
-	}
+	remaining := quotaRemaining(limit, used)
 
 	return &QuotaStatus{
 		Feature:   feature,
