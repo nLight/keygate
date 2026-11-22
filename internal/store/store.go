@@ -155,7 +155,7 @@ func (s *Store) RunMigrations(dir string) error {
 				return fmt.Errorf("record migration %s: %w", entry.Name(), err)
 			}
 
-			if err := tx.Commit(); err != nil {
+			if err := commitTx(migCtx, tx); err != nil {
 				return fmt.Errorf("commit %s: %w", entry.Name(), err)
 			}
 			return nil
@@ -398,7 +398,7 @@ func (s *Store) DemoteOwnerAtomic(ctx context.Context, targetID string) error {
 		return err
 	}
 
-	return tx.Commit()
+	return commitTx(ctx, tx)
 }
 
 // ─── API Key ───
@@ -540,7 +540,7 @@ func (s *Store) CreateLicenseWithSubscription(ctx context.Context, l *model.Lice
 		}
 	}
 
-	return tx.Commit()
+	return commitTx(ctx, tx)
 }
 
 func (s *Store) FindLicenseByKey(ctx context.Context, key string) (*model.License, error) {
@@ -613,7 +613,7 @@ func (s *Store) UpdateLicenseAndSubscription(ctx context.Context, lic *model.Lic
 		return fmt.Errorf("sync subscription status: %w", err)
 	}
 
-	return tx.Commit()
+	return commitTx(ctx, tx)
 }
 
 // ErrLicenseRestricted: a write driven by a Stripe event was refused
@@ -640,7 +640,7 @@ var ErrLicenseRestricted = errors.New("license is revoked, suspended by an opera
 // live (an "unpaid" subscription, mapped to canceled, that was then
 // paid). An event payload is history and may predate the end.
 func (s *Store) UpdateLicenseFromWebhook(ctx context.Context, lic *model.License, reviveCanceled bool, cols ...string) error {
-	return s.DB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
 		lic.UpdatedAt = time.Now()
 		allCols := append(append([]string{}, cols...), "updated_at")
 		if lic.Status == model.StatusSuspended && slices.Contains(cols, "status") {
@@ -1039,7 +1039,7 @@ func (s *Store) RotateRefreshToken(ctx context.Context, tokenHash string) (*Refr
 		return nil, err
 	}
 	rt.RevokedAt = &now
-	return rt, tx.Commit()
+	return rt, commitTx(ctx, tx)
 }
 
 // DeleteRefreshToken removes a token outright. Used on logout, where
@@ -1101,7 +1101,7 @@ func (s *Store) CreateOTPCodeWithLimit(ctx context.Context, otp *model.OTPCode, 
 	if _, err := tx.NewInsert().Model(otp).Exec(ctx); err != nil {
 		return false, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commitTx(ctx, tx); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1151,7 +1151,7 @@ func (s *Store) ConsumeOTPCode(ctx context.Context, email, candidateVerifier, du
 	if n, _ := res.RowsAffected(); n != 1 {
 		return nil, false, nil
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commitTx(ctx, tx); err != nil {
 		return nil, false, err
 	}
 	otp.Attempts++
@@ -1275,7 +1275,7 @@ func (s *Store) ActivateWithinLimit(ctx context.Context, act *model.Activation, 
 		return err
 	}
 
-	return tx.Commit()
+	return commitTx(ctx, tx)
 }
 
 // ─── Email Queue ───
@@ -1629,4 +1629,31 @@ func (s *Store) WithKeyMaintenanceLock(ctx context.Context, fn func(context.Cont
 	}()
 
 	return fn(ctx)
+}
+
+// commitTx commits, first making sure the transaction can still commit.
+// pgdriver answers nil to a COMMIT that Postgres turned into a rollback,
+// so a failed statement whose error was dropped would read as a write
+// that landed. Any statement on an aborted transaction fails (25P02);
+// this one costs a round trip and nothing else. (Upstream da630ed.)
+func commitTx(ctx context.Context, tx bun.Tx) error {
+	if _, err := tx.ExecContext(ctx, "SELECT 1"); err != nil {
+		return fmt.Errorf("transaction cannot commit: %w", err)
+	}
+	return tx.Commit()
+}
+
+// RunInTx runs fn in a transaction and commits it through commitTx, so
+// a statement that failed inside fn (even with its error dropped) is
+// reported instead of reading as a write that landed.
+func RunInTx(ctx context.Context, db *bun.DB, fn func(ctx context.Context, tx bun.Tx) error) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := fn(ctx, tx); err != nil {
+		return err
+	}
+	return commitTx(ctx, tx)
 }

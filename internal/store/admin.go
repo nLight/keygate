@@ -253,7 +253,7 @@ var ErrLicenseNotSuspendable = errors.New("only an active, trialing or past-due 
 // together, so a failure part-way cannot leave a revoked licence with
 // live devices or a usable one without them.
 func (s *Store) RevokeLicense(ctx context.Context, id string) error {
-	return s.DB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
 		now := time.Now()
 		// Only stamp the first revocation: a repeated call must not move the
 		// date, which is the record of when access was actually pulled.
@@ -282,7 +282,7 @@ func (s *Store) RevokeLicense(ctx context.Context, id string) error {
 // accepts a suspended licence, so revoke → suspend → reinstate would
 // otherwise bring a revoked licence back.
 func (s *Store) SuspendLicense(ctx context.Context, id string) error {
-	return s.DB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
 		now := time.Now()
 		res, err := tx.NewUpdate().Model((*model.License)(nil)).
 			Set("status = ?, suspended_at = ?, suspended_by = ?, updated_at = ?", model.StatusSuspended, now, model.SuspendedByAdmin, now).

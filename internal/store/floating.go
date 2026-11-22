@@ -54,7 +54,7 @@ func (s *Store) CheckOutFloatingWithLimit(ctx context.Context, sess *model.Float
 			return false, err
 		}
 		sess.ID = existingID
-		return false, tx.Commit()
+		return false, commitTx(ctx, tx)
 	}
 
 	// Lock the license row to serialize concurrent checkouts for the same license.
@@ -84,7 +84,7 @@ func (s *Store) CheckOutFloatingWithLimit(ctx context.Context, sess *model.Float
 		return false, err
 	}
 
-	return true, tx.Commit()
+	return true, commitTx(ctx, tx)
 }
 
 func (s *Store) CheckInFloating(ctx context.Context, licenseID, identifier string) error {

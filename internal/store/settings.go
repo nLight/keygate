@@ -58,7 +58,7 @@ func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 // make sense together (e.g. a webhook endpoint ID and its signing secret)
 // are never persisted half-updated.
 func (s *Store) SetSettings(ctx context.Context, settings map[string]string) error {
-	return s.DB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
 		for key, value := range settings {
 			if err := upsertSetting(ctx, tx, key, value); err != nil {
 				return err

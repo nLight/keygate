@@ -200,7 +200,7 @@ func (s *Store) RotateSigningKey(ctx context.Context, newKey *model.ReleaseSigni
 		}
 		return err
 	}
-	return tx.Commit()
+	return commitTx(ctx, tx)
 }
 
 // stringHash returns a deterministic int64 hash of s. Used to derive

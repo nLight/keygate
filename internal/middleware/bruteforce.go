@@ -46,10 +46,10 @@ func (bf *BruteForceProtection) RecordFailure(key string) {
 	defer bf.mu.Unlock()
 
 	now := time.Now()
-	rec, exists := bf.attempts[key]
-	if !exists {
-		bf.attempts[key] = &attemptRecord{failures: 1, firstFailure: now}
-		return
+	rec := bf.attempts[key]
+	if rec == nil {
+		rec = &attemptRecord{}
+		bf.attempts[key] = rec
 	}
 	if rec.lockedUntil.After(now) {
 		// A request that passed the guard just before this lockout began
@@ -60,11 +60,9 @@ func (bf *BruteForceProtection) RecordFailure(key string) {
 	if now.Sub(rec.firstFailure) > bf.window {
 		// A new window starts the failure count again, but not the
 		// lockout count: that count is what doubles each further
-		// lockout. Replacing the record here dropped it, and a caller
-		// who comes back when a lockout longer than the window ends
-		// always lands here. With the defaults the lockouts went 30s,
-		// 1m, 2m, 4m, 8m and then 30s again, never reaching the cap.
-		rec.failures = 1
+		// lockout, and a caller back when a lockout longer than the
+		// window ends always lands here.
+		rec.failures = 0
 		rec.firstFailure = now
 		// The count lasts as long as the longest lockout after the last
 		// one ended. An address many people share (an office, a school)
@@ -73,19 +71,17 @@ func (bf *BruteForceProtection) RecordFailure(key string) {
 		if now.Sub(rec.lockedUntil) > bf.maxLockout {
 			rec.lockoutCount = 0
 		}
-		return
 	}
 
 	rec.failures++
 	if rec.failures >= bf.maxFails {
-		// Exponential backoff: lockout * 2^lockoutCount, capped at maxLockout
-		duration := bf.lockout
-		for i := 0; i < rec.lockoutCount; i++ {
-			duration *= 2
-			if duration > bf.maxLockout {
-				duration = bf.maxLockout
-				break
-			}
+		// Exponential backoff: lockout * 2^lockoutCount, capped at
+		// maxLockout, the first lockout included.
+		duration := min(bf.lockout, bf.maxLockout)
+		// A lockout of zero or less (BF_LOCKOUT_SECONDS=0) blocks nobody,
+		// and must not loop or overflow on a count that keeps growing.
+		for i := 0; i < rec.lockoutCount && duration > 0 && duration < bf.maxLockout; i++ {
+			duration = min(duration*2, bf.maxLockout)
 		}
 		rec.lockedUntil = now.Add(duration)
 		rec.lockoutCount++

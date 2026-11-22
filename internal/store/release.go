@@ -377,7 +377,7 @@ func (s *Store) DeleteRelease(ctx context.Context, id string) (fileKeys []string
 		Where("id = ? AND status = ?", id, model.ReleaseStatusDraft).Exec(ctx); err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commitTx(ctx, tx); err != nil {
 		return nil, err
 	}
 	return keys, nil
@@ -478,7 +478,7 @@ func (s *Store) CreateArtifact(ctx context.Context, a *model.ReleaseArtifact) er
 		}
 		return err
 	}
-	return tx.Commit()
+	return commitTx(ctx, tx)
 }
 
 // FindArtifact returns an artifact by ID.
@@ -554,7 +554,7 @@ func (s *Store) UpdateArtifactFile(ctx context.Context, id, fileKey string, size
 	`, fileKey, size, sha256, contentType, id).Exec(ctx); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return commitTx(ctx, tx)
 }
 
 // UpdateArtifactSignature stores the Ed25519 signature for an artifact.
@@ -613,7 +613,7 @@ func (s *Store) DeleteArtifact(ctx context.Context, id string) (fileKey string, 
 		Where("id = ?", id).Exec(ctx); err != nil {
 		return "", err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commitTx(ctx, tx); err != nil {
 		return "", err
 	}
 	return fileKey, nil

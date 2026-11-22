@@ -142,3 +142,42 @@ func TestFailuresDuringALockoutDoNotCount(t *testing.T) {
 		t.Fatalf("next lockout %v, want 1m", left.Round(time.Second))
 	}
 }
+
+// With BF_MAX_FAILS=1 the first failure locks, in a fresh record as in
+// a new window.
+func TestOneFailureAllowed(t *testing.T) {
+	bf := NewBruteForceProtection(1, 30*time.Second, 30*time.Minute, 5*time.Minute)
+	key := FailureKeyIP("203.0.113.12")
+	bf.RecordFailure(key)
+	if blocked, _ := bf.IsBlocked(key); !blocked {
+		t.Fatal("not locked out after the one failure allowed")
+	}
+}
+
+// The cap holds for the first lockout too, whatever BF_LOCKOUT_SECONDS
+// says.
+func TestFirstLockoutIsCapped(t *testing.T) {
+	bf := NewBruteForceProtection(5, time.Hour, 30*time.Minute, 5*time.Minute)
+	key := FailureKeyIP("203.0.113.13")
+	for range 5 {
+		bf.RecordFailure(key)
+	}
+	if _, left := bf.IsBlocked(key); left.Round(time.Second) != 30*time.Minute {
+		t.Fatalf("first lockout %v, want the 30m cap", left.Round(time.Second))
+	}
+}
+
+// BF_LOCKOUT_SECONDS=0 blocks nobody, however many failures pile up,
+// and a negative value does not overflow into a lockout.
+func TestNoLockoutWhenDisabled(t *testing.T) {
+	for _, lockout := range []time.Duration{0, -time.Second} {
+		bf := NewBruteForceProtection(5, lockout, 30*time.Minute, 5*time.Minute)
+		key := FailureKeyIP("203.0.113.14")
+		for range 100000 {
+			bf.RecordFailure(key)
+		}
+		if blocked, _ := bf.IsBlocked(key); blocked {
+			t.Fatalf("lockout %v: blocked", lockout)
+		}
+	}
+}

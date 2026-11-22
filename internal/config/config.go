@@ -89,7 +89,7 @@ type Config struct {
 
 	// Brute-force protection on /license/* — caps repeated bad license
 	// keys per IP. In tests these defaults are too tight, so they're
-	// configurable via env: BF_MAX_FAILS=5 / BF_LOCKOUT=30s / etc.
+	// configurable via env: BF_MAX_FAILS=5 / BF_LOCKOUT_SECONDS=30.
 	BFMaxFails       int
 	BFLockoutSeconds int
 
