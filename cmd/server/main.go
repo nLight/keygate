@@ -390,10 +390,23 @@ func main() {
 	}
 	r := gin.Default()
 
-	// Trust reverse proxy headers (Traefik, Nginx, etc.) to get real client IP.
-	// Trusts X-Forwarded-For / X-Real-Ip from private network ranges.
-	r.SetTrustedProxies([]string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"})
-	r.RemoteIPHeaders = []string{"X-Forwarded-For", "X-Real-Ip"}
+	// Whose X-Forwarded-For / X-Real-Ip is believed: TRUSTED_PROXIES,
+	// private networks when unset. The client address keys rate limits
+	// and lockouts, so a spoofable one lets a client pick its own bucket.
+	proxies, err := trustProxies(r, cfg.TrustedProxies)
+	if err != nil {
+		logger.Error("TRUSTED_PROXIES is not a list of addresses", "error", err)
+		os.Exit(1)
+	}
+	switch {
+	case len(proxies) == 0:
+		logger.Info("client address: no proxy trusted", "trusted_proxies", "none")
+	case trustsEveryone(proxies):
+		logger.Warn("TRUSTED_PROXIES trusts every address: any client can choose the address its rate limits and lockouts count under",
+			"trusted_proxies", strings.Join(proxies, ","))
+	default:
+		logger.Info("client address: X-Forwarded-For believed from", "trusted_proxies", strings.Join(proxies, ","))
+	}
 
 	r.Use(middleware.RequestID())
 	r.Use(middleware.PrometheusMetrics())

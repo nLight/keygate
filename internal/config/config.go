@@ -93,6 +93,10 @@ type Config struct {
 	BFMaxFails       int
 	BFLockoutSeconds int
 
+	// TrustedProxies is TRUSTED_PROXIES as written: the proxies whose
+	// X-Forwarded-For is believed (see cmd/server/trusted_proxies.go).
+	TrustedProxies string
+
 	AdminEmails []string
 
 	// ─── Storage (release artifacts: R2 / S3 / S3-compatible) ───
@@ -231,6 +235,7 @@ func Load() (*Config, error) {
 	cfg.RateLimitOTPSend = envIntOr("RATE_LIMIT_OTP_SEND", 30)
 	cfg.BFMaxFails = envIntOr("BF_MAX_FAILS", 5)
 	cfg.BFLockoutSeconds = envIntOr("BF_LOCKOUT_SECONDS", 30)
+	cfg.TrustedProxies = os.Getenv("TRUSTED_PROXIES")
 
 	cfg.WebhookMaxAttempts = envIntOr("WEBHOOK_MAX_ATTEMPTS", 5)
 	cfg.WebhookRetryInterval = envOr("WEBHOOK_RETRY_INTERVAL", "30s")
