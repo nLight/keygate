@@ -285,7 +285,7 @@ func main() {
 	entitlementH := handler.NewEntitlementHandler(entitlementSvc)
 	floatingH := handler.NewFloatingHandler(floatingSvc)
 	webhookAdminH := handler.NewWebhookAdminHandler(db, webhookSvc)
-	systemH := handler.NewSystemHandler(db)
+	systemH := handler.NewSystemHandler(db, os.Getenv("UPDATE_CHECK_REPO"))
 	releaseAdminH := handler.NewReleaseAdminHandler(releaseSvc, db)
 	releasePublicH := handler.NewReleasePublicHandler(handler.ReleasePublicConfig{
 		Service:     releaseSvc,
