@@ -17,7 +17,8 @@ func (s *Store) ListProducts(ctx context.Context, search string) ([]*model.Produ
 	var out []*model.Product
 	q := s.DB.NewSelect().Model(&out).OrderExpr("created_at DESC")
 	if search != "" {
-		q = q.Where("name ILIKE ? OR slug ILIKE ?", "%"+search+"%", "%"+search+"%")
+		term := "%" + escapeLike(search) + "%"
+		q = q.Where(`name ILIKE ? ESCAPE '\' OR slug ILIKE ? ESCAPE '\'`, term, term)
 	}
 	err := q.Scan(ctx)
 	return out, err
@@ -55,7 +56,8 @@ func (s *Store) ListPlans(ctx context.Context, productID, search string) ([]*mod
 		q = q.Where("plan.product_id = ?", productID)
 	}
 	if search != "" {
-		q = q.Where("plan.name ILIKE ? OR plan.slug ILIKE ?", "%"+search+"%", "%"+search+"%")
+		term := "%" + escapeLike(search) + "%"
+		q = q.Where(`plan.name ILIKE ? ESCAPE '\' OR plan.slug ILIKE ? ESCAPE '\'`, term, term)
 	}
 	err := q.Scan(ctx)
 	return out, err
@@ -155,7 +157,8 @@ func (s *Store) ListAPIKeys(ctx context.Context, productID, search string) ([]*m
 		q = q.Where("api_key.product_id = ?", productID)
 	}
 	if search != "" {
-		q = q.Where("api_key.name ILIKE ? OR api_key.prefix ILIKE ?", "%"+search+"%", "%"+search+"%")
+		term := "%" + escapeLike(search) + "%"
+		q = q.Where(`api_key.name ILIKE ? ESCAPE '\' OR api_key.prefix ILIKE ? ESCAPE '\'`, term, term)
 	}
 	err := q.Scan(ctx)
 	return out, err
@@ -409,7 +412,8 @@ func (s *Store) GetStats(ctx context.Context) (*Stats, error) {
 func (s *Store) ListUsers(ctx context.Context, search string, offset, limit int) ([]*model.User, int, error) {
 	q := s.DB.NewSelect().Model((*model.User)(nil)).Where("role = 'user'")
 	if search != "" {
-		q = q.Where("(email ILIKE ? OR name ILIKE ?)", "%"+search+"%", "%"+search+"%")
+		term := "%" + escapeLike(search) + "%"
+		q = q.Where(`(email ILIKE ? ESCAPE '\' OR name ILIKE ? ESCAPE '\')`, term, term)
 	}
 	total, err := q.Count(ctx)
 	if err != nil {

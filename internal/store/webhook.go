@@ -29,7 +29,8 @@ func (s *Store) ListWebhooks(ctx context.Context, productID, search string) ([]*
 		q = q.Where("webhook.product_id = ?", productID)
 	}
 	if search != "" {
-		q = q.Where("webhook.url ILIKE ?", "%"+search+"%")
+		term := "%" + escapeLike(search) + "%"
+		q = q.Where(`webhook.url ILIKE ? ESCAPE '\'`, term)
 	}
 	err := q.Scan(ctx)
 	return out, err

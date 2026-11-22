@@ -644,6 +644,12 @@ type LicenseListFilter struct {
 	Limit               int
 }
 
+// escapeLike makes a search term match literally in LIKE / ILIKE ...
+// ESCAPE '\': its %, _ and \ stand for themselves.
+func escapeLike(term string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(term)
+}
+
 func (s *Store) ListLicenses(ctx context.Context, f LicenseListFilter) ([]*model.License, int, error) {
 	q := s.DB.NewSelect().Model((*model.License)(nil)).
 		Relation("Plan").Relation("Product").
@@ -661,8 +667,12 @@ func (s *Store) ListLicenses(ctx context.Context, f LicenseListFilter) ([]*model
 		q = q.Where("license.external_workspace_id = ?", f.ExternalWorkspaceID)
 	}
 	if f.Search != "" {
-		// Only search by email and key prefix — never expose full key via wildcard search.
-		q = q.Where("(license.email ILIKE ? OR license.license_key LIKE ?)", "%"+f.Search+"%", f.Search+"%")
+		// Email by substring; a license key only as a whole, by its hash.
+		// Plaintext keys are not stored, so the old key-prefix LIKE
+		// matched nothing, and a wildcard over keys is not wanted anyway.
+		term := "%" + escapeLike(f.Search) + "%"
+		q = q.Where(`(license.email ILIKE ? ESCAPE '\' OR license.key_hash = ?)`,
+			term, license.HashKey(strings.TrimSpace(f.Search)))
 	}
 	total, err := q.Count(ctx)
 	if err != nil {
