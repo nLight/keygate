@@ -150,3 +150,34 @@ func TestSetLiveLicenseValidUntil(t *testing.T) {
 		t.Errorf("canceled licence valid_until moved to %v, want %v", got.ValidUntil, now)
 	}
 }
+
+// Of many callers claiming the same notification at once, exactly one
+// gets it.
+func TestClaimNotificationIsExclusive(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	lic := createTestLicense(t, s, ctx)
+	var wins int32
+	done := make(chan bool, 20)
+	for i := 0; i < 20; i++ {
+		go func() {
+			ok, err := s.ClaimNotification(ctx, lic.ID, "dunning_first:1")
+			if err != nil {
+				t.Error(err)
+			}
+			done <- ok
+		}()
+	}
+	for i := 0; i < 20; i++ {
+		if <-done {
+			wins++
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("claims won = %d, want 1", wins)
+	}
+	if !s.HasNotification(ctx, lic.ID, "dunning_first:1") {
+		t.Error("claimed notification not recorded")
+	}
+}

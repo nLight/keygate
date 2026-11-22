@@ -954,6 +954,23 @@ func (s *Store) RecordNotification(ctx context.Context, licenseID, tag string) {
 	).Exec(ctx)
 }
 
+// ClaimNotification records a notification for a license before it is
+// sent, and reports whether this caller is the one to send it. The
+// insert is the claim: of several replicas (or two webhooks racing)
+// running the same reminder, exactly one gets true. A check-then-record
+// let every one of them see "not sent" and mail the customer.
+func (s *Store) ClaimNotification(ctx context.Context, licenseID, tag string) (bool, error) {
+	res, err := s.DB.NewRaw(
+		"INSERT INTO notifications (id, license_id, tag) VALUES (?, ?, ?) ON CONFLICT (license_id, tag) DO NOTHING",
+		newID(), licenseID, tag,
+	).Exec(ctx)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // ─── Refresh Tokens ───
 
 type RefreshToken struct {

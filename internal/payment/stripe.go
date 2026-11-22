@@ -860,13 +860,15 @@ func (h *StripeHandler) notifyPaymentRecovered(ctx context.Context, lic *model.L
 	if p, err := h.Store.FindProductByID(ctx, lic.ProductID); err == nil {
 		productName = p.Name
 	}
-	if h.Store.HasNotification(ctx, lic.ID, tag) {
+	// Claimed before anything is sent: invoice.paid and
+	// subscription.updated often arrive together, and a check-then-record
+	// let both send the email and dispatch the webhook.
+	if claimed, err := h.Store.ClaimNotification(ctx, lic.ID, tag); err != nil || !claimed {
 		return
 	}
 	if h.Email != nil {
 		h.Email.SendPaymentRecovered(lic.Email, productName)
 	}
-	h.Store.RecordNotification(ctx, lic.ID, tag)
 	if h.WebhookSvc != nil {
 		h.WebhookSvc.Dispatch(ctx, lic.ProductID, "license.payment_recovered", map[string]any{
 			"license_id": lic.ID, "email": lic.Email,
@@ -1606,7 +1608,7 @@ func (h *StripeHandler) onTrialWillEnd(ctx context.Context, raw json.RawMessage)
 		return
 	}
 	productName := h.productName(ctx, lic.ProductID)
-	trialEnd := time.Unix(data.TrialEnd, 0).Format("2006-01-02")
+	trialEnd := time.Unix(data.TrialEnd, 0).UTC().Format("2006-01-02")
 	if h.Email != nil {
 		h.Email.SendTrialEnding(lic.Email, productName, trialEnd)
 	}
