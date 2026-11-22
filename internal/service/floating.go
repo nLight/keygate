@@ -65,6 +65,12 @@ func (s *FloatingService) CheckOut(ctx context.Context, in CheckOutInput) (*Chec
 	// This prevents race conditions where concurrent checkouts could exceed maxSessions
 	isNew, err := s.store.CheckOutFloatingWithLimit(ctx, sess, maxSessions)
 	if err != nil {
+		var stopped *store.LicenseStoppedError
+		if errors.As(err, &stopped) {
+			// Stopped since it was loaded; same answer as any other
+			// unusable licence on this public endpoint.
+			return nil, licenseNotFound()
+		}
 		if errors.Is(err, store.ErrFloatingLimitReached) {
 			active, _ := s.store.CountActiveFloating(ctx, lic.ID)
 			return nil, apperr.WithDetails(

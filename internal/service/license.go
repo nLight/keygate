@@ -165,6 +165,12 @@ func (s *LicenseService) Activate(ctx context.Context, in ActivateInput) (*Activ
 		IPAddress: in.IPAddress,
 	}
 	if err := s.store.ActivateWithinLimit(ctx, act, max); err != nil {
+		var stopped *store.LicenseStoppedError
+		if errors.As(err, &stopped) {
+			// Stopped after assertUsable read it: answer as it would now.
+			lic.Status = stopped.Status
+			return nil, s.assertUsable(lic)
+		}
 		if err.Error() == "activation limit reached" {
 			middleware.LicenseActivations.WithLabelValues(lic.ProductID, "failed").Inc()
 			count, _ := s.store.CountActivations(ctx, lic.ID)

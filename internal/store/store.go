@@ -1107,6 +1107,34 @@ func (s *Store) ForgetProcessedEvent(ctx context.Context, provider, eventID stri
 
 // ─── Transactional Activation ───
 
+// stoppedLicenseStatuses are the statuses under which a licence takes no
+// new device or floating session.
+var stoppedLicenseStatuses = []string{model.StatusSuspended, model.StatusExpired, model.StatusRevoked}
+
+// LicenseStoppedError: the licence was revoked, suspended or expired
+// after the caller read it usable and before it took the licence lock.
+type LicenseStoppedError struct{ Status string }
+
+func (e *LicenseStoppedError) Error() string { return "license is " + e.Status }
+
+// lockUsableLicense takes the licence row lock that serialises new
+// devices and sessions, and refuses one that is stopped. The caller
+// checked the status before the lock; a revoke, suspend or expiry that
+// committed in between must not be followed by a new device or session
+// (revoke deletes them, so one added after it would outlive it).
+func lockUsableLicense(ctx context.Context, tx bun.Tx, licenseID string) error {
+	var status string
+	if err := tx.NewRaw("SELECT status FROM licenses WHERE id = ? FOR UPDATE", licenseID).Scan(ctx, &status); err != nil {
+		return err
+	}
+	for _, st := range stoppedLicenseStatuses {
+		if status == st {
+			return &LicenseStoppedError{Status: status}
+		}
+	}
+	return nil
+}
+
 // ActivateWithinLimit atomically creates an activation only if the limit hasn't been reached.
 // Locks the license row (not activation rows) to serialize concurrent activations.
 func (s *Store) ActivateWithinLimit(ctx context.Context, act *model.Activation, maxActivations int) error {
@@ -1120,9 +1148,9 @@ func (s *Store) ActivateWithinLimit(ctx context.Context, act *model.Activation, 
 	}
 	defer tx.Rollback()
 
-	// Lock the license row to serialize concurrent activations
-	_, err = tx.NewRaw("SELECT id FROM licenses WHERE id = ? FOR UPDATE", act.LicenseID).Exec(ctx)
-	if err != nil {
+	// Lock the license row to serialize concurrent activations, and
+	// re-read its status under the lock (see lockUsableLicense).
+	if err := lockUsableLicense(ctx, tx, act.LicenseID); err != nil {
 		return err
 	}
 

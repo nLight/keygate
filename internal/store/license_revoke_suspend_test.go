@@ -89,3 +89,33 @@ func TestSuspendLicense_RefusesRevokedAndSuspended(t *testing.T) {
 		t.Errorf("status = %s, want revoked", st)
 	}
 }
+
+// A device or floating session is refused once the licence is stopped,
+// even when the caller read it usable before taking the licence lock.
+func TestNewDeviceOrSessionRefusedOnStoppedLicense(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	for _, stop := range []func(string) error{
+		func(id string) error { return s.RevokeLicense(ctx, id) },
+		func(id string) error { return s.SuspendLicense(ctx, id) },
+		func(id string) error {
+			_, err := s.DB.NewRaw("UPDATE licenses SET status = ? WHERE id = ?", model.StatusExpired, id).Exec(ctx)
+			return err
+		},
+	} {
+		lic := createTestLicense(t, s, ctx)
+		if err := stop(lic.ID); err != nil {
+			t.Fatalf("stop: %v", err)
+		}
+		var stopped *store.LicenseStoppedError
+		err := s.ActivateWithinLimit(ctx, &model.Activation{LicenseID: lic.ID, Identifier: "m", IdentifierType: "device"}, 5)
+		if !errors.As(err, &stopped) {
+			t.Errorf("activation on stopped licence: err = %v, want LicenseStoppedError", err)
+		}
+		_, err = s.CheckOutFloatingWithLimit(ctx, &model.FloatingSession{LicenseID: lic.ID, Identifier: "m", ExpiresAt: time.Now().Add(time.Hour)}, 5)
+		if !errors.As(err, &stopped) {
+			t.Errorf("floating checkout on stopped licence: err = %v, want LicenseStoppedError", err)
+		}
+	}
+}
