@@ -611,6 +611,11 @@ func (s *Store) GetRecentActivity(ctx context.Context, productID string, limit i
 		ColumnExpr("id, entity, entity_id, action, actor_type, created_at").
 		OrderExpr("created_at DESC").
 		Limit(limit)
+	// The product filter was accepted and ignored: a product's dashboard
+	// listed every product's activity.
+	if productID != "" {
+		q = auditOfProduct(q, productID)
+	}
 	err := q.Scan(ctx, &out)
 	return out, err
 }

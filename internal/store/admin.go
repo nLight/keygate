@@ -366,6 +366,21 @@ func (s *Store) ExportLicenses(ctx context.Context, f LicenseExportFilter) ([]*m
 // addon, webhook, release, api_key, plus the product row itself). It
 // is best-effort: 2-hop entities (seat, activation, release_artifact)
 // aren't matched and silently fall out of the filtered view.
+// auditOfProduct narrows an audit_logs query to one product: the
+// product itself and everything that belongs to it. The audit page and
+// the analytics activity feed both scope through here. (Upstream 2cef6a9.)
+func auditOfProduct(q *bun.SelectQuery, productID string) *bun.SelectQuery {
+	return q.Where(`(
+            (entity = 'product' AND entity_id = ?)
+         OR entity_id IN (SELECT id FROM licenses  WHERE product_id = ?)
+         OR entity_id IN (SELECT id FROM plans     WHERE product_id = ?)
+         OR entity_id IN (SELECT id FROM addons    WHERE product_id = ?)
+         OR entity_id IN (SELECT id FROM webhooks  WHERE product_id = ?)
+         OR entity_id IN (SELECT id FROM releases  WHERE product_id = ?)
+         OR entity_id IN (SELECT id FROM api_keys  WHERE product_id = ?)
+        )`, productID, productID, productID, productID, productID, productID, productID)
+}
+
 func (s *Store) ListAuditLogs(ctx context.Context, entity, entityID, productID string, offset, limit int) ([]*model.AuditLog, int, error) {
 	q := s.DB.NewSelect().Model((*model.AuditLog)(nil)).OrderExpr("created_at DESC")
 	if entity != "" {
@@ -375,15 +390,7 @@ func (s *Store) ListAuditLogs(ctx context.Context, entity, entityID, productID s
 		q = q.Where("entity_id = ?", entityID)
 	}
 	if productID != "" {
-		q = q.Where(`(
-            (entity = 'product' AND entity_id = ?)
-         OR entity_id IN (SELECT id FROM licenses  WHERE product_id = ?)
-         OR entity_id IN (SELECT id FROM plans     WHERE product_id = ?)
-         OR entity_id IN (SELECT id FROM addons    WHERE product_id = ?)
-         OR entity_id IN (SELECT id FROM webhooks  WHERE product_id = ?)
-         OR entity_id IN (SELECT id FROM releases  WHERE product_id = ?)
-         OR entity_id IN (SELECT id FROM api_keys  WHERE product_id = ?)
-        )`, productID, productID, productID, productID, productID, productID, productID)
+		q = auditOfProduct(q, productID)
 	}
 	total, err := q.Count(ctx)
 	if err != nil {
