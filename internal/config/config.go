@@ -89,9 +89,13 @@ type Config struct {
 
 	// Brute-force protection on /license/* — caps repeated bad license
 	// keys per IP. In tests these defaults are too tight, so they're
-	// configurable via env: BF_MAX_FAILS=5 / BF_LOCKOUT=30s / etc.
+	// configurable via env: BF_MAX_FAILS=5 / BF_LOCKOUT_SECONDS=30.
 	BFMaxFails       int
 	BFLockoutSeconds int
+
+	// TrustedProxies is TRUSTED_PROXIES as written: the proxies whose
+	// X-Forwarded-For is believed (see cmd/server/trusted_proxies.go).
+	TrustedProxies string
 
 	AdminEmails []string
 
@@ -231,6 +235,7 @@ func Load() (*Config, error) {
 	cfg.RateLimitOTPSend = envIntOr("RATE_LIMIT_OTP_SEND", 30)
 	cfg.BFMaxFails = envIntOr("BF_MAX_FAILS", 5)
 	cfg.BFLockoutSeconds = envIntOr("BF_LOCKOUT_SECONDS", 30)
+	cfg.TrustedProxies = os.Getenv("TRUSTED_PROXIES")
 
 	cfg.WebhookMaxAttempts = envIntOr("WEBHOOK_MAX_ATTEMPTS", 5)
 	cfg.WebhookRetryInterval = envOr("WEBHOOK_RETRY_INTERVAL", "30s")

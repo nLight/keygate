@@ -47,7 +47,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useI18n } from "@/i18n"
-import { admin } from "@/lib/api"
+import { admin, type UsageCounter } from "@/lib/api"
 import { formatDate, statusColor } from "@/lib/utils"
 
 // A date picked in the expiry field means "valid through that whole
@@ -932,14 +932,17 @@ function UsageTab({ licenseId }: { licenseId: string }) {
     queryFn: () => admin.getLicenseUsage(licenseId, { offset: page * limit, limit }),
   })
 
-  // confirmResetUsage holds the feature name pending confirmation.
+  // confirmResetUsage holds the counter row pending confirmation. A
+  // feature has a counter per period; resetting by feature alone reset
+  // a row other than the one clicked. (Upstream d00f760.)
   // Reset is destructive: it zeroes the counter for the live period,
   // which most plans will treat as "free re-use until the next
   // reset" — a stray click can effectively grant the customer free
   // usage. The AlertDialog forces an intentional click.
-  const [confirmResetUsage, setConfirmResetUsage] = useState<string | null>(null)
+  const [confirmResetUsage, setConfirmResetUsage] = useState<UsageCounter | null>(null)
   const resetMut = useMutation({
-    mutationFn: (feature: string) => admin.resetUsageCounter(licenseId, { feature }),
+    mutationFn: (c: UsageCounter) =>
+      admin.resetUsageCounter(licenseId, { feature: c.feature, period: c.period, period_key: c.period_key }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["admin", "license-usage", licenseId] })
       setConfirmResetUsage(null)
@@ -988,8 +991,8 @@ function UsageTab({ licenseId }: { licenseId: string }) {
                       size="icon"
                       className="h-7 w-7"
                       title={t("licenses.resetCounter")}
-                      onClick={() => setConfirmResetUsage(c.feature)}
-                      disabled={resetMut.isPending && resetMut.variables === c.feature}
+                      onClick={() => setConfirmResetUsage(c)}
+                      disabled={resetMut.isPending && resetMut.variables?.id === c.id}
                     >
                       <RefreshCw className="h-3 w-3" />
                     </Button>
@@ -1045,7 +1048,13 @@ function UsageTab({ licenseId }: { licenseId: string }) {
       <AlertDialog open={!!confirmResetUsage} onOpenChange={() => setConfirmResetUsage(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>{t("licenses.resetCounterTitle", { feature: confirmResetUsage || "" })}</AlertDialogTitle>
+            <AlertDialogTitle>
+              {t("licenses.resetCounterTitle", {
+                feature: confirmResetUsage
+                  ? `${confirmResetUsage.feature} (${confirmResetUsage.period} ${confirmResetUsage.period_key})`
+                  : "",
+              })}
+            </AlertDialogTitle>
             <AlertDialogDescription>{t("licenses.resetCounterDesc")}</AlertDialogDescription>
           </AlertDialogHeader>
           <div className="flex justify-end gap-2">

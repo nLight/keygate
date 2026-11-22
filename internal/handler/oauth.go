@@ -20,7 +20,33 @@ import (
 	"github.com/tabloy/keygate/pkg/response"
 )
 
+// requestIsHTTPS reports whether the browser reached this server over
+// TLS — directly, through a proxy that terminated it, or because the
+// install says so itself (BASE_URL), for a proxy that forwards
+// nothing. It decides the Secure attribute on the session cookies,
+// and the request's own scheme is what must decide it: a Secure
+// cookie handed to a browser over plain HTTP is dropped without a
+// word, so the login answers 200 and every request after it 401s.
+// The environment name says nothing about how the browser got here.
+//
+// A client that puts X-Forwarded-Proto: https on a plain request only
+// stops its own cookie from being stored; it cannot take the
+// attribute off anyone else's.
+func (h *AuthHandler) requestIsHTTPS(c *gin.Context) bool {
+	if c.Request.TLS != nil {
+		return true
+	}
+	// A chain of proxies appends: the first entry is the scheme the
+	// browser used.
+	proto, _, _ := strings.Cut(c.GetHeader("X-Forwarded-Proto"), ",")
+	if strings.EqualFold(strings.TrimSpace(proto), "https") {
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(h.Config.BaseURL), "https://")
+}
+
 // setSecureCookie sets a cookie with SameSite=Lax for CSRF protection.
+// secure marks it HTTPS-only; see requestIsHTTPS for who may set it.
 func setSecureCookie(c *gin.Context, name, value string, maxAge int, path string, secure, httpOnly bool) {
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     name,
@@ -70,8 +96,8 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 			ActorType: "user", ActorID: uid, IPAddress: c.ClientIP(),
 		})
 	}
-	setSecureCookie(c, "session", "", -1, "/", h.Config.IsProduction(), true)
-	setSecureCookie(c, "refresh_token", "", -1, "/api/v1/auth/refresh", h.Config.IsProduction(), true)
+	setSecureCookie(c, "session", "", -1, "/", h.requestIsHTTPS(c), true)
+	setSecureCookie(c, "refresh_token", "", -1, "/api/v1/auth/refresh", h.requestIsHTTPS(c), true)
 	response.OK(c, gin.H{"status": "logged_out"})
 }
 
@@ -97,7 +123,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 			"user_id", rt.UserID, "token_id", rt.ID)
 		// Clear the cookie on the client so the next page load
 		// doesn't try the dead token again.
-		setSecureCookie(c, "refresh_token", "", -1, "/api/v1/auth/refresh", h.Config.IsProduction(), true)
+		setSecureCookie(c, "refresh_token", "", -1, "/api/v1/auth/refresh", h.requestIsHTTPS(c), true)
 		response.Unauthorized(c, "refresh token reuse detected")
 		return
 	}
@@ -127,14 +153,14 @@ func (h *AuthHandler) issueSession(c *gin.Context, user *model.User) {
 		h.Config.JWTSecret, user.ID, user.Email, user.Name,
 		user.IsAdmin(), 24*time.Hour,
 	)
-	setSecureCookie(c, "session", token, 24*3600, "/", h.Config.IsProduction(), true)
+	setSecureCookie(c, "session", token, 24*3600, "/", h.requestIsHTTPS(c), true)
 
 	// Long-lived refresh token (30 days)
 	rawRefresh := randomHex(32)
 	refreshHash := hashToken(rawRefresh)
 	expiresAt := time.Now().Add(30 * 24 * time.Hour)
 	_ = h.Store.CreateRefreshToken(c, user.ID, refreshHash, expiresAt)
-	setSecureCookie(c, "refresh_token", rawRefresh, 30*24*3600, "/api/v1/auth/refresh", h.Config.IsProduction(), true)
+	setSecureCookie(c, "refresh_token", rawRefresh, 30*24*3600, "/api/v1/auth/refresh", h.requestIsHTTPS(c), true)
 }
 
 func hashToken(raw string) string {

@@ -299,9 +299,18 @@ func (s *Store) GetAnalyticsSummary(ctx context.Context, f AnalyticsFilter) (*An
 		return nil, err
 	}
 
+	// The average is over the licences whose devices were counted. With
+	// a status picked those are the licences in that status, not the
+	// total above, which leaves the status filter out.
+	licenses := result.Total
+	if f.Status != "" {
+		if licenses, err = licenseSubquery(s, f).Count(ctx); err != nil {
+			return nil, err
+		}
+	}
 	var avgActivations float64
-	if result.Total > 0 {
-		avgActivations = float64(activations) / float64(result.Total)
+	if licenses > 0 {
+		avgActivations = float64(activations) / float64(licenses)
 	}
 
 	return &AnalyticsSummary{
@@ -602,6 +611,11 @@ func (s *Store) GetRecentActivity(ctx context.Context, productID string, limit i
 		ColumnExpr("id, entity, entity_id, action, actor_type, created_at").
 		OrderExpr("created_at DESC").
 		Limit(limit)
+	// The product filter was accepted and ignored: a product's dashboard
+	// listed every product's activity.
+	if productID != "" {
+		q = auditOfProduct(q, productID)
+	}
 	err := q.Scan(ctx, &out)
 	return out, err
 }
@@ -620,9 +634,12 @@ func (s *Store) GetTopUsers(ctx context.Context, productID string, limit int) ([
 		ColumnExpr("COUNT(DISTINCT l.id)::int AS license_count").
 		ColumnExpr("COUNT(DISTINCT l.id) FILTER (WHERE l.status = 'active')::int AS active_count").
 		ColumnExpr("COALESCE(SUM(uc.total_usage), 0) AS total_usage").
-		ColumnExpr("COUNT(DISTINCT a.id)::int AS activation_count").
+		ColumnExpr("COALESCE(SUM(ac.activations), 0)::int AS activation_count").
+		// Usage and devices are each counted per licence before the
+		// join: joined row by row, a licence's usage was added once for
+		// every device it runs on.
 		Join("LEFT JOIN (SELECT license_id, SUM(quantity) AS total_usage FROM usage_events GROUP BY license_id) uc ON uc.license_id = l.id").
-		Join("LEFT JOIN activations a ON a.license_id = l.id").
+		Join("LEFT JOIN (SELECT license_id, COUNT(*) AS activations FROM activations GROUP BY license_id) ac ON ac.license_id = l.id").
 		// Exclude admin users from customer rankings
 		Where("l.email NOT IN (SELECT email FROM users WHERE role IN ('owner', 'admin'))").
 		GroupExpr("l.email, l.user_id").

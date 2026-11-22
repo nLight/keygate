@@ -162,8 +162,8 @@ func (c *ExpiryChecker) SendExpiryReminders(ctx context.Context) {
 			continue
 		}
 		for _, lic := range licenses {
-			// Check if we already sent this reminder
-			if c.store.HasNotification(ctx, lic.ID, r.tag) {
+			// Claimed before it is sent, so two replicas never both send it.
+			if claimed, err := c.store.ClaimNotification(ctx, lic.ID, r.tag); err != nil || !claimed {
 				continue
 			}
 			productName := ""
@@ -172,10 +172,9 @@ func (c *ExpiryChecker) SendExpiryReminders(ctx context.Context) {
 			}
 			expiresAt := ""
 			if lic.ValidUntil != nil {
-				expiresAt = lic.ValidUntil.Format("2006-01-02")
+				expiresAt = lic.ValidUntil.UTC().Format("2006-01-02")
 			}
 			c.email.SendLicenseExpiring(lic.Email, productName, c.store.DecryptLicenseKey(lic), expiresAt)
-			c.store.RecordNotification(ctx, lic.ID, r.tag)
 			c.logger.Info("expiry reminder sent", "license_id", lic.ID, "days", r.days)
 		}
 	}
@@ -196,7 +195,8 @@ func (c *ExpiryChecker) CleanupExpiredActivations(ctx context.Context) {
 // SendPaymentFailureReminders walks every past_due license up the
 // dunning ladder. Anchored on lic.PastDueAt so unrelated row writes
 // (audit, sync) don't reset the clock. Each step is gated by
-// HasNotification + a unique tag per past_due_at epoch, so:
+// ClaimNotification (an insert, so one replica wins) + a unique tag per
+// past_due_at epoch, so:
 //
 //   - the same email never fires twice for one episode, even if the
 //     checker runs every hour;
@@ -251,11 +251,15 @@ func (c *ExpiryChecker) SendPaymentFailureReminders(ctx context.Context) {
 				continue
 			}
 			tag := step.tag + ":" + strconvI64(episode)
-			if c.store.HasNotification(ctx, lic.ID, tag) {
-				break // already sent the highest-tier; nothing lower will fire
+			claimed, err := c.store.ClaimNotification(ctx, lic.ID, tag)
+			if err != nil {
+				c.logger.Error("dunning claim failed", "license_id", lic.ID, "tag", step.tag, "error", err)
+				break // the next run tries again
+			}
+			if !claimed {
+				break // already sent the highest tier, or another replica is sending it
 			}
 			step.send(lic.Email, productName)
-			c.store.RecordNotification(ctx, lic.ID, tag)
 			c.logger.Info("dunning email sent",
 				"license_id", lic.ID, "tag", step.tag,
 				"days_past_due", daysPastDue, "episode", episode)
@@ -291,7 +295,7 @@ func (c *ExpiryChecker) SendRenewalReminders(ctx context.Context) {
 			continue
 		}
 		tag := "renewal_24h"
-		if c.store.HasNotification(ctx, lic.ID, tag) {
+		if claimed, err := c.store.ClaimNotification(ctx, lic.ID, tag); err != nil || !claimed {
 			continue
 		}
 		productName := ""
@@ -300,10 +304,9 @@ func (c *ExpiryChecker) SendRenewalReminders(ctx context.Context) {
 		}
 		renewalDate := ""
 		if lic.ValidUntil != nil {
-			renewalDate = lic.ValidUntil.Format("2006-01-02")
+			renewalDate = lic.ValidUntil.UTC().Format("2006-01-02")
 		}
 		c.email.SendRenewalReminder(lic.Email, productName, renewalDate)
-		c.store.RecordNotification(ctx, lic.ID, tag)
 	}
 }
 

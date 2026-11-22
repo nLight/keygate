@@ -95,8 +95,8 @@ func (s *EntitlementService) Check(ctx context.Context, in CheckInput) (*CheckRe
 		}
 
 		switch e.ValueType {
-		case "bool":
-			fs.Enabled = e.Value == "true"
+		case "bool", "flag":
+			fs.Enabled = featureEnabled(e.ValueType, e.Value)
 		case "quota":
 			limit, _ := strconv.ParseInt(e.Value, 10, 64)
 			period := e.QuotaPeriod
@@ -109,10 +109,7 @@ func (s *EntitlementService) Check(ctx context.Context, in CheckInput) (*CheckRe
 			if counter != nil {
 				used = counter.Used
 			}
-			remaining := limit - used
-			if limit == 0 {
-				remaining = -1
-			}
+			remaining := quotaRemaining(limit, used)
 			fs.Used = &used
 			fs.Limit = &limit
 			fs.Remaining = &remaining
@@ -139,8 +136,8 @@ func (s *EntitlementService) Check(ctx context.Context, in CheckInput) (*CheckRe
 			Enabled:   true,
 		}
 		switch a.ValueType {
-		case "bool":
-			fs.Enabled = a.Value == "true"
+		case "bool", "flag":
+			fs.Enabled = featureEnabled(a.ValueType, a.Value)
 		case "quota":
 			limit, _ := strconv.ParseInt(a.Value, 10, 64)
 			period := a.QuotaPeriod
@@ -153,10 +150,7 @@ func (s *EntitlementService) Check(ctx context.Context, in CheckInput) (*CheckRe
 			if counter != nil {
 				used = counter.Used
 			}
-			remaining := limit - used
-			if limit == 0 {
-				remaining = -1
-			}
+			remaining := quotaRemaining(limit, used)
 			fs.Used = &used
 			fs.Limit = &limit
 			fs.Remaining = &remaining
@@ -183,4 +177,16 @@ func nextPeriodReset(period string) string {
 	default:
 		return ""
 	}
+}
+
+// featureEnabled reads a bool or flag feature. A bool needs "true". A
+// flag is stored unchecked and was reported as enabled whatever it
+// held (even "false"), and sent as a string in verify answers, so only
+// an explicit "false" turns one off: an existing "1" or "yes" keeps
+// working. (Upstream 60c661e.)
+func featureEnabled(valueType, value string) bool {
+	if valueType == "flag" {
+		return value != "false"
+	}
+	return value == "true"
 }

@@ -6,6 +6,23 @@ the public network, and configure the proxy with body/header limits no looser
 than `MAX_REQUEST_BODY_KB`, `STRIPE_WEBHOOK_MAX_KB`, and
 `HTTP_MAX_HEADER_KB`.
 
+## Client address (`TRUSTED_PROXIES`)
+
+Rate limits and brute-force lockouts are counted per client IP. Keygate
+believes `X-Forwarded-For` / `X-Real-Ip` only from the proxies listed in
+`TRUSTED_PROXIES` (IPs or CIDRs, comma separated; unset = private networks,
+`none` = no proxy).
+
+- Proxy on the same host, app bound to loopback (the layout above): set
+  `TRUSTED_PROXIES=127.0.0.1,::1`. Loopback is **not** trusted by default, so
+  without this every client is seen as `127.0.0.1` and a single lockout or
+  rate-limit bucket applies to all of them.
+- Proxy on a private network (Docker, Kubernetes): the default works, but
+  naming the proxy's exact address is tighter.
+- No HTTP proxy in front: set `none`.
+- Never list a plain TCP forwarder or `0.0.0.0/0`; any client could then pick
+  the address its limits are counted under.
+
 ## Required secrets
 
 Generate independent secrets for every environment and store them in a secrets

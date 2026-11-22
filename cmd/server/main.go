@@ -13,9 +13,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -283,7 +285,7 @@ func main() {
 	entitlementH := handler.NewEntitlementHandler(entitlementSvc)
 	floatingH := handler.NewFloatingHandler(floatingSvc)
 	webhookAdminH := handler.NewWebhookAdminHandler(db, webhookSvc)
-	systemH := handler.NewSystemHandler(db)
+	systemH := handler.NewSystemHandler(db, os.Getenv("UPDATE_CHECK_REPO"))
 	releaseAdminH := handler.NewReleaseAdminHandler(releaseSvc, db)
 	releasePublicH := handler.NewReleasePublicHandler(handler.ReleasePublicConfig{
 		Service:     releaseSvc,
@@ -390,10 +392,23 @@ func main() {
 	}
 	r := gin.Default()
 
-	// Trust reverse proxy headers (Traefik, Nginx, etc.) to get real client IP.
-	// Trusts X-Forwarded-For / X-Real-Ip from private network ranges.
-	r.SetTrustedProxies([]string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"})
-	r.RemoteIPHeaders = []string{"X-Forwarded-For", "X-Real-Ip"}
+	// Whose X-Forwarded-For / X-Real-Ip is believed: TRUSTED_PROXIES,
+	// private networks when unset. The client address keys rate limits
+	// and lockouts, so a spoofable one lets a client pick its own bucket.
+	proxies, err := trustProxies(r, cfg.TrustedProxies)
+	if err != nil {
+		logger.Error("TRUSTED_PROXIES is not a list of addresses", "error", err)
+		os.Exit(1)
+	}
+	switch {
+	case len(proxies) == 0:
+		logger.Info("client address: no proxy trusted", "trusted_proxies", "none")
+	case trustsEveryone(proxies):
+		logger.Warn("TRUSTED_PROXIES trusts every address: any client can choose the address its rate limits and lockouts count under",
+			"trusted_proxies", strings.Join(proxies, ","))
+	default:
+		logger.Info("client address: X-Forwarded-For believed from", "trusted_proxies", strings.Join(proxies, ","))
+	}
 
 	r.Use(middleware.RequestID())
 	r.Use(middleware.PrometheusMetrics())
@@ -678,11 +693,8 @@ func main() {
 				return
 			}
 
-			// Sanitize: trim whitespace, strip HTML tags, limit length
-			name := strings.TrimSpace(req.Name)
-			// Strip HTML tags to prevent XSS
-			name = stripHTMLTags(name)
-			if len(name) > 100 {
+			name, ok := profileName(req.Name)
+			if !ok {
 				response.BadRequest(c, "name too long (max 100 characters)")
 				return
 			}
@@ -1063,24 +1075,33 @@ func main() {
 	log.Println("Server exited gracefully")
 }
 
-// stripHTMLTags removes all HTML tags from a string to prevent XSS.
-func stripHTMLTags(s string) string {
-	var result strings.Builder
-	inTag := false
-	for _, r := range s {
-		if r == '<' {
-			inTag = true
-			continue
-		}
-		if r == '>' {
-			inTag = false
-			continue
-		}
-		if !inTag {
-			result.WriteRune(r)
-		}
+var htmlTagPattern = regexp.MustCompile(`(?i)<[/!]?[a-z][^<>]*>|<!--[\s\S]*?-->`)
+
+// profileName is the name a profile update stores: trimmed, at most 100
+// characters (runes, not bytes: a Cyrillic or CJK name was cut at half
+// or a third of that), with HTML tags stripped. ok is false when longer.
+//
+// The length is checked before the tags are stripped. Stripping takes a
+// pass per level of nested tags, so on an unbounded input its time grows
+// with the square of the length.
+func profileName(raw string) (name string, ok bool) {
+	name = strings.TrimSpace(raw)
+	if utf8.RuneCountInString(name) > 100 {
+		return "", false
 	}
-	return result.String()
+	return stripHTMLTags(name), true
+}
+
+// stripHTMLTags removes HTML tags from a string. A lone '<' that opens no
+// tag ("a < b", "<3") is kept; the old character scanner dropped
+// everything after it. Output is escaped where it is rendered; this is
+// defence in depth, not the XSS boundary. Callers bound its input (see
+// profileName).
+func stripHTMLTags(s string) string {
+	for htmlTagPattern.MatchString(s) {
+		s = htmlTagPattern.ReplaceAllString(s, "")
+	}
+	return s
 }
 
 // serveFrontend serves the React SPA from web/dist if it exists.

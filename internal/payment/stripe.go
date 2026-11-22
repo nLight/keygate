@@ -259,11 +259,11 @@ func (h *StripeHandler) Webhook(c *gin.Context) {
 	case "checkout.session.completed":
 		h.onCheckoutCompleted(ctx, event.Data.Raw)
 	case "invoice.paid":
-		h.onInvoicePaid(ctx, event.Data.Raw)
+		handlerErr = h.onInvoicePaid(ctx, event.Data.Raw)
 	case "customer.subscription.updated":
 		h.onSubscriptionUpdated(ctx, event.Data.Raw)
 	case "customer.subscription.deleted":
-		h.onSubscriptionDeleted(ctx, event.Data.Raw)
+		handlerErr = h.onSubscriptionDeleted(ctx, event.Data.Raw)
 	case "invoice.payment_failed":
 		h.onPaymentFailed(ctx, event.Data.Raw)
 	case "charge.refunded":
@@ -615,19 +615,30 @@ func (h *StripeHandler) subscriptionPeriodEnd(subID string) (int64, error) {
 	return end, iter.Err()
 }
 
-func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) {
+func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) error {
 	var data webhookInvoice
 	if json.Unmarshal(raw, &data) != nil {
-		return
+		return nil
 	}
 	subID := data.subscriptionID()
 	if subID == "" {
-		return
+		return nil
 	}
 
 	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, subID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
-		return
+		return err // database unavailable: let Stripe retry
+	}
+	reviveCanceled := false
+	if lic.Status == model.StatusCanceled {
+		live, err := subscriptionLiveNow(subID)
+		if err != nil {
+			return err // Stripe unavailable: let Stripe retry the payment event
+		}
+		reviveCanceled = live
 	}
 	wasPastDue := lic.Status == model.StatusPastDue
 	// Capture the episode anchor BEFORE the write clears it.
@@ -652,7 +663,12 @@ func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) 
 	}
 	lic.Status = model.StatusActive
 	lic.PastDueAt = nil
-	_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, cols...)
+	// Paid: retried on a failed write, which is safe (it sets the same
+	// state again) and keeps a paying customer from staying past due.
+	landed, err := h.webhookWrite(ctx, lic, "invoice.paid", reviveCanceled, cols...)
+	if err != nil || !landed {
+		return err
+	}
 
 	// Recovery notification — shares the dedup path with
 	// onSubscriptionUpdated. Some flows emit invoice.paid without a
@@ -661,6 +677,7 @@ func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) 
 	if wasPastDue {
 		h.notifyPaymentRecovered(ctx, lic, episode)
 	}
+	return nil
 }
 
 // webhookSubscription is the subset of a basil-era Subscription object
@@ -696,6 +713,47 @@ func (sub *webhookSubscription) currentPeriodEnd() int64 {
 // license's lifecycle columns and returns the columns to write. Shared by
 // the subscription webhook and by the refund reconciliation so the two
 // never drift into disagreeing about what a Stripe status means.
+// webhookWrite applies a license write driven by a Stripe event through
+// the guarded store write. It reports whether the write landed; a write
+// refused because the licence is revoked, suspended by an operator or
+// ended is logged and reported as not landed with a nil error, and the
+// caller skips its side effects. Any other error is returned.
+func (h *StripeHandler) webhookWrite(ctx context.Context, lic *model.License, event string, reviveCanceled bool, cols ...string) (bool, error) {
+	err := h.Store.UpdateLicenseFromWebhook(ctx, lic, reviveCanceled, cols...)
+	if errors.Is(err, store.ErrLicenseRestricted) {
+		slog.Info("stripe webhook: license is revoked, suspended by an operator, ended or unlinked; event not applied",
+			"event", event, "license_id", lic.ID, "subscription_id", lic.StripeSubscriptionID)
+		return false, nil
+	}
+	if err != nil {
+		slog.Error("stripe webhook: license write failed", "event", event, "license_id", lic.ID, "error", err)
+		return false, err
+	}
+	return true, nil
+}
+
+// subscriptionLiveNow reads the subscription from Stripe and reports
+// whether it is live (active, trialing or past due). Used before a
+// payment event may revive a canceled licence.
+//
+// A failed read is returned as an error, not as "not live": a payment
+// event that cannot tell must be retried, or a paying customer whose
+// "unpaid" subscription recovered stays canceled.
+func subscriptionLiveNow(subID string) (bool, error) {
+	sub, err := subscription.Get(subID, nil)
+	if err != nil {
+		return false, fmt.Errorf("read subscription %s: %w", subID, err)
+	}
+	if sub == nil {
+		return false, nil
+	}
+	switch sub.Status {
+	case stripe.SubscriptionStatusActive, stripe.SubscriptionStatusTrialing, stripe.SubscriptionStatusPastDue:
+		return true, nil
+	}
+	return false, nil
+}
+
 func applySubscriptionStatus(lic *model.License, status string) []string {
 	switch status {
 	case "active":
@@ -749,6 +807,7 @@ func (h *StripeHandler) onSubscriptionUpdated(ctx context.Context, raw json.RawM
 	// (clearing past_due_at, firing the recovered email) only run when
 	// the transition is actually past_due → active.
 	wasPastDue := lic.Status == model.StatusPastDue
+	wasCanceled := lic.Status == model.StatusCanceled
 	// Anchor for the episode-scoped recovered notification tag.
 	// Captured here because the write below nulls past_due_at.
 	var episode int64
@@ -774,7 +833,24 @@ func (h *StripeHandler) onSubscriptionUpdated(ctx context.Context, raw json.RawM
 		slog.Warn("stripe customer.subscription.updated: no item period, valid_until unchanged",
 			"subscription_id", data.ID, "license_id", lic.ID)
 	}
-	_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, cols...)
+	// A payload saying "live" may predate the end; only a fresh read
+	// may bring a canceled licence back.
+	reviveCanceled := false
+	if wasCanceled && lic.Status != model.StatusCanceled {
+		live, err := subscriptionLiveNow(data.ID)
+		if err != nil {
+			// Not retried (order-sensitive); invoice.paid, which is
+			// retried, revives it if the subscription is live.
+			slog.Warn("stripe customer.subscription.updated: subscription read failed, canceled licence not revived",
+				"subscription_id", data.ID, "license_id", lic.ID, "error", err)
+		}
+		reviveCanceled = live
+	}
+	// Not retried: Stripe retries out of order, and an older state
+	// applied late would undo a newer one.
+	if landed, _ := h.webhookWrite(ctx, lic, "customer.subscription.updated", reviveCanceled, cols...); !landed {
+		return
+	}
 
 	// Recovery notification fires only on past_due → active. Routed
 	// through notifyPaymentRecovered so concurrent webhooks (Stripe
@@ -808,13 +884,15 @@ func (h *StripeHandler) notifyPaymentRecovered(ctx context.Context, lic *model.L
 	if p, err := h.Store.FindProductByID(ctx, lic.ProductID); err == nil {
 		productName = p.Name
 	}
-	if h.Store.HasNotification(ctx, lic.ID, tag) {
+	// Claimed before anything is sent: invoice.paid and
+	// subscription.updated often arrive together, and a check-then-record
+	// let both send the email and dispatch the webhook.
+	if claimed, err := h.Store.ClaimNotification(ctx, lic.ID, tag); err != nil || !claimed {
 		return
 	}
 	if h.Email != nil {
 		h.Email.SendPaymentRecovered(lic.Email, productName)
 	}
-	h.Store.RecordNotification(ctx, lic.ID, tag)
 	if h.WebhookSvc != nil {
 		h.WebhookSvc.Dispatch(ctx, lic.ProductID, "license.payment_recovered", map[string]any{
 			"license_id": lic.ID, "email": lic.Email,
@@ -822,23 +900,31 @@ func (h *StripeHandler) notifyPaymentRecovered(ctx context.Context, lic *model.L
 	}
 }
 
-func (h *StripeHandler) onSubscriptionDeleted(ctx context.Context, raw json.RawMessage) {
+func (h *StripeHandler) onSubscriptionDeleted(ctx context.Context, raw json.RawMessage) error {
 	var data struct {
 		ID string `json:"id"`
 	}
 	if json.Unmarshal(raw, &data) != nil {
-		return
+		return nil
 	}
 
 	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
-		return
+		return err
 	}
 	lic.Status = model.StatusCanceled
 	now := time.Now()
 	lic.CanceledAt = &now
 	lic.PastDueAt = nil
-	_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, "status", "canceled_at", "past_due_at")
+	// Retried on a failed write: Stripe never revives a deleted
+	// subscription, so a late retry has no newer state to undo.
+	landed, err := h.webhookWrite(ctx, lic, "customer.subscription.deleted", false, "status", "canceled_at", "past_due_at")
+	if err != nil || !landed {
+		return err
+	}
 
 	h.Store.Audit(ctx, &model.AuditLog{
 		Entity: "license", EntityID: lic.ID, Action: "canceled",
@@ -850,6 +936,7 @@ func (h *StripeHandler) onSubscriptionDeleted(ctx context.Context, raw json.RawM
 			"license_id": lic.ID, "email": lic.Email, "reason": "subscription_deleted",
 		})
 	}
+	return nil
 }
 
 func (h *StripeHandler) onPaymentFailed(ctx context.Context, raw json.RawMessage) {
@@ -867,7 +954,9 @@ func (h *StripeHandler) onPaymentFailed(ctx context.Context, raw json.RawMessage
 		now := time.Now()
 		lic.Status = model.StatusPastDue
 		lic.PastDueAt = &now
-		_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, "status", "past_due_at")
+		if landed, _ := h.webhookWrite(ctx, lic, "invoice.payment_failed", false, "status", "past_due_at"); !landed {
+			return
+		}
 
 		h.Store.Audit(ctx, &model.AuditLog{
 			Entity: "license", EntityID: lic.ID, Action: "payment_failed",
@@ -994,7 +1083,9 @@ func (h *StripeHandler) reconcileSubscription(ctx context.Context, lic *model.Li
 		cols = append(cols, "valid_until")
 	}
 
-	if err := h.Store.UpdateLicenseAndSubscription(ctx, lic, cols...); err != nil {
+	// Guarded like any Stripe-driven write; this one comes from a fresh
+	// read, so it may revive a canceled licence whose subscription is live.
+	if _, err := h.webhookWrite(ctx, lic, "reconcile", true, cols...); err != nil {
 		return "", err
 	}
 	return string(sub.Status), nil
@@ -1120,7 +1211,12 @@ func (h *StripeHandler) CancelSubscription(c *gin.Context) {
 		lic.Status = model.StatusCanceled
 		lic.CanceledAt = &now
 		lic.ValidUntil = &now
-		_ = h.Store.UpdateLicense(c, lic, "status", "canceled_at", "valid_until")
+		// With the subscription row, as every other status write: the
+		// customer.subscription.deleted webhook that follows repeats it
+		// if this one fails, so a failure is logged, not answered.
+		if err := h.Store.UpdateLicenseAndSubscription(c, lic, "status", "canceled_at", "valid_until"); err != nil {
+			slog.Error("stripe: immediate cancel not recorded locally", "license_id", lic.ID, "error", err)
+		}
 	} else {
 		sub, updateErr := subscription.Update(lic.StripeSubscriptionID, &stripe.SubscriptionParams{
 			CancelAtPeriodEnd: stripe.Bool(true),
@@ -1129,10 +1225,18 @@ func (h *StripeHandler) CancelSubscription(c *gin.Context) {
 			response.Internal(c)
 			return
 		}
-		// Set ValidUntil to when Stripe will cancel the subscription
-		periodEnd := time.Unix(sub.CancelAt, 0)
-		lic.ValidUntil = &periodEnd
-		_ = h.Store.UpdateLicense(c, lic, "valid_until")
+		// Set ValidUntil to when Stripe will cancel the subscription.
+		// Without that date in the answer (cancel_at 0) the
+		// subscription.updated webhook sets it: time.Unix(0) would end
+		// the licence at once, on 1970-01-01. The write is guarded so it
+		// cannot push the date back out on a licence that has already
+		// ended (an immediate cancel or revoke racing this one).
+		if sub.CancelAt > 0 {
+			periodEnd := time.Unix(sub.CancelAt, 0)
+			if err := h.Store.SetLiveLicenseValidUntil(c, lic.ID, periodEnd); err != nil {
+				slog.Warn("stripe: cancel-at-period-end valid_until not written", "license_id", lic.ID, "error", err)
+			}
+		}
 	}
 
 	h.Store.Audit(c, &model.AuditLog{
@@ -1158,10 +1262,12 @@ func (h *StripeHandler) CancelSubscription(c *gin.Context) {
 }
 
 func (h *StripeHandler) ChangePlan(c *gin.Context) {
+	// There is no proration switch. It was the customer's to set, and
+	// "none" let one move to a dearer plan for the rest of a period
+	// without paying the difference, then move back before renewal.
 	var req struct {
 		LicenseID  string `json:"license_id" binding:"required"`
 		NewPriceID string `json:"new_price_id" binding:"required"`
-		Prorate    *bool  `json:"prorate"` // default true
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "license_id and new_price_id are required")
@@ -1227,10 +1333,8 @@ func (h *StripeHandler) ChangePlan(c *gin.Context) {
 		return
 	}
 
+	// Always prorated: the customer pays for the time spent on each plan.
 	prorationBehavior := "create_prorations"
-	if req.Prorate != nil && !*req.Prorate {
-		prorationBehavior = "none"
-	}
 
 	params := &stripe.SubscriptionParams{
 		ProrationBehavior: stripe.String(prorationBehavior),
@@ -1469,7 +1573,11 @@ func (h *StripeHandler) onSubscriptionPaused(ctx context.Context, raw json.RawMe
 	lic.Status = model.StatusSuspended
 	now := time.Now()
 	lic.SuspendedAt = &now
-	_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, "status", "suspended_at")
+	// Recorded as Stripe's suspension (suspended_by), which a resume
+	// lifts; it does not replace an operator's.
+	if landed, _ := h.webhookWrite(ctx, lic, "customer.subscription.paused", false, "status", "suspended_at"); !landed {
+		return
+	}
 
 	h.Store.Audit(ctx, &model.AuditLog{
 		Entity: "license", EntityID: lic.ID, Action: "suspended",
@@ -1495,7 +1603,10 @@ func (h *StripeHandler) onSubscriptionResumed(ctx context.Context, raw json.RawM
 	}
 	lic.Status = model.StatusActive
 	lic.SuspendedAt = nil
-	_ = h.Store.UpdateLicenseAndSubscription(ctx, lic, "status", "suspended_at")
+	// Lifts a Stripe pause only: an operator's suspension stays.
+	if landed, _ := h.webhookWrite(ctx, lic, "customer.subscription.resumed", false, "status", "suspended_at"); !landed {
+		return
+	}
 
 	h.Store.Audit(ctx, &model.AuditLog{
 		Entity: "license", EntityID: lic.ID, Action: "reinstated",
@@ -1521,7 +1632,7 @@ func (h *StripeHandler) onTrialWillEnd(ctx context.Context, raw json.RawMessage)
 		return
 	}
 	productName := h.productName(ctx, lic.ProductID)
-	trialEnd := time.Unix(data.TrialEnd, 0).Format("2006-01-02")
+	trialEnd := time.Unix(data.TrialEnd, 0).UTC().Format("2006-01-02")
 	if h.Email != nil {
 		h.Email.SendTrialEnding(lic.Email, productName, trialEnd)
 	}

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/uptrace/bun"
+
 	"github.com/tabloy/keygate/internal/model"
 )
 
@@ -17,7 +19,8 @@ func (s *Store) ListProducts(ctx context.Context, search string) ([]*model.Produ
 	var out []*model.Product
 	q := s.DB.NewSelect().Model(&out).OrderExpr("created_at DESC")
 	if search != "" {
-		q = q.Where("name ILIKE ? OR slug ILIKE ?", "%"+search+"%", "%"+search+"%")
+		term := "%" + escapeLike(search) + "%"
+		q = q.Where(`name ILIKE ? ESCAPE '\' OR slug ILIKE ? ESCAPE '\'`, term, term)
 	}
 	err := q.Scan(ctx)
 	return out, err
@@ -55,7 +58,8 @@ func (s *Store) ListPlans(ctx context.Context, productID, search string) ([]*mod
 		q = q.Where("plan.product_id = ?", productID)
 	}
 	if search != "" {
-		q = q.Where("plan.name ILIKE ? OR plan.slug ILIKE ?", "%"+search+"%", "%"+search+"%")
+		term := "%" + escapeLike(search) + "%"
+		q = q.Where(`plan.name ILIKE ? ESCAPE '\' OR plan.slug ILIKE ? ESCAPE '\'`, term, term)
 	}
 	err := q.Scan(ctx)
 	return out, err
@@ -155,7 +159,8 @@ func (s *Store) ListAPIKeys(ctx context.Context, productID, search string) ([]*m
 		q = q.Where("api_key.product_id = ?", productID)
 	}
 	if search != "" {
-		q = q.Where("api_key.name ILIKE ? OR api_key.prefix ILIKE ?", "%"+search+"%", "%"+search+"%")
+		term := "%" + escapeLike(search) + "%"
+		q = q.Where(`api_key.name ILIKE ? ESCAPE '\' OR api_key.prefix ILIKE ? ESCAPE '\'`, term, term)
 	}
 	err := q.Scan(ctx)
 	return out, err
@@ -235,44 +240,76 @@ func (s *Store) FindLicenseByID(ctx context.Context, id string) (*model.License,
 		Scan(ctx)
 }
 
+// ErrLicenseNotFound: no licence has the id given.
+var ErrLicenseNotFound = errors.New("license not found")
+
+// ErrLicenseNotSuspendable refuses to suspend a licence that is not in
+// use: suspending a revoked, expired or canceled licence would let a
+// later reinstate turn it active again.
+var ErrLicenseNotSuspendable = errors.New("only an active, trialing or past-due license can be suspended")
+
+// RevokeLicense pulls access in one transaction: the status, its
+// devices and floating sessions, and the linked subscription row go
+// together, so a failure part-way cannot leave a revoked licence with
+// live devices or a usable one without them.
 func (s *Store) RevokeLicense(ctx context.Context, id string) error {
-	_, _ = s.DB.NewDelete().Model((*model.Activation)(nil)).Where("license_id = ?", id).Exec(ctx)
-	now := time.Now()
-	// Only stamp the first revocation: a repeated call must not move the
-	// date, which is the record of when access was actually pulled.
-	res, err := s.DB.NewUpdate().Model((*model.License)(nil)).
-		Set("status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?", model.StatusRevoked, now, now).
-		Where("id = ?", id).Exec(ctx)
-	if err != nil {
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		now := time.Now()
+		// Only stamp the first revocation: a repeated call must not move the
+		// date, which is the record of when access was actually pulled.
+		res, err := tx.NewUpdate().Model((*model.License)(nil)).
+			Set("status = ?, revoked_at = COALESCE(revoked_at, ?), updated_at = ?", model.StatusRevoked, now, now).
+			Where("id = ?", id).Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrLicenseNotFound
+		}
+		if _, err := tx.NewDelete().Model((*model.Activation)(nil)).Where("license_id = ?", id).Exec(ctx); err != nil {
+			return err
+		}
+		if _, err := tx.NewDelete().Model((*model.FloatingSession)(nil)).Where("license_id = ?", id).Exec(ctx); err != nil {
+			return err
+		}
+		_, err = tx.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now() WHERE license_id = ?`, model.StatusRevoked, id).Exec(ctx)
 		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("license not found")
-	}
-	_, _ = s.DB.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now() WHERE license_id = ?`, model.StatusRevoked, id).Exec(ctx)
-	return nil
+	})
 }
 
+// SuspendLicense suspends a licence in use. It refuses one that is
+// revoked, expired or canceled (ErrLicenseNotSuspendable): reinstate
+// accepts a suspended licence, so revoke → suspend → reinstate would
+// otherwise bring a revoked licence back.
 func (s *Store) SuspendLicense(ctx context.Context, id string) error {
-	now := time.Now()
-	res, err := s.DB.NewUpdate().Model((*model.License)(nil)).
-		Set("status = ?, suspended_at = ?, updated_at = ?", model.StatusSuspended, now, now).
-		Where("id = ?", id).Exec(ctx)
-	if err != nil {
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		now := time.Now()
+		res, err := tx.NewUpdate().Model((*model.License)(nil)).
+			Set("status = ?, suspended_at = ?, suspended_by = ?, updated_at = ?", model.StatusSuspended, now, model.SuspendedByAdmin, now).
+			Where("id = ?", id).
+			Where("status IN (?)", bun.In([]string{model.StatusActive, model.StatusTrialing, model.StatusPastDue})).
+			Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			var exists bool
+			if err := tx.NewRaw("SELECT EXISTS (SELECT 1 FROM licenses WHERE id = ?)", id).Scan(ctx, &exists); err != nil {
+				return err
+			}
+			if exists {
+				return ErrLicenseNotSuspendable
+			}
+			return ErrLicenseNotFound
+		}
+		_, err = tx.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now() WHERE license_id = ?`, model.StatusSuspended, id).Exec(ctx)
 		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("license not found")
-	}
-	_, _ = s.DB.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now() WHERE license_id = ?`, model.StatusSuspended, id).Exec(ctx)
-	return nil
+	})
 }
 
 func (s *Store) ReinstateLicense(ctx context.Context, id string) error {
 	res, err := s.DB.NewUpdate().Model((*model.License)(nil)).
-		Set("status = ?, suspended_at = NULL, canceled_at = NULL, updated_at = ?", model.StatusActive, time.Now()).
+		Set("status = ?, suspended_at = NULL, suspended_by = NULL, canceled_at = NULL, updated_at = ?", model.StatusActive, time.Now()).
 		Where("id = ?", id).
 		Where("status IN ('suspended', 'expired', 'canceled')").
 		Exec(ctx)
@@ -329,6 +366,21 @@ func (s *Store) ExportLicenses(ctx context.Context, f LicenseExportFilter) ([]*m
 // addon, webhook, release, api_key, plus the product row itself). It
 // is best-effort: 2-hop entities (seat, activation, release_artifact)
 // aren't matched and silently fall out of the filtered view.
+// auditOfProduct narrows an audit_logs query to one product: the
+// product itself and everything that belongs to it. The audit page and
+// the analytics activity feed both scope through here. (Upstream 2cef6a9.)
+func auditOfProduct(q *bun.SelectQuery, productID string) *bun.SelectQuery {
+	return q.Where(`(
+            (entity = 'product' AND entity_id = ?)
+         OR entity_id IN (SELECT id FROM licenses  WHERE product_id = ?)
+         OR entity_id IN (SELECT id FROM plans     WHERE product_id = ?)
+         OR entity_id IN (SELECT id FROM addons    WHERE product_id = ?)
+         OR entity_id IN (SELECT id FROM webhooks  WHERE product_id = ?)
+         OR entity_id IN (SELECT id FROM releases  WHERE product_id = ?)
+         OR entity_id IN (SELECT id FROM api_keys  WHERE product_id = ?)
+        )`, productID, productID, productID, productID, productID, productID, productID)
+}
+
 func (s *Store) ListAuditLogs(ctx context.Context, entity, entityID, productID string, offset, limit int) ([]*model.AuditLog, int, error) {
 	q := s.DB.NewSelect().Model((*model.AuditLog)(nil)).OrderExpr("created_at DESC")
 	if entity != "" {
@@ -338,15 +390,7 @@ func (s *Store) ListAuditLogs(ctx context.Context, entity, entityID, productID s
 		q = q.Where("entity_id = ?", entityID)
 	}
 	if productID != "" {
-		q = q.Where(`(
-            (entity = 'product' AND entity_id = ?)
-         OR entity_id IN (SELECT id FROM licenses  WHERE product_id = ?)
-         OR entity_id IN (SELECT id FROM plans     WHERE product_id = ?)
-         OR entity_id IN (SELECT id FROM addons    WHERE product_id = ?)
-         OR entity_id IN (SELECT id FROM webhooks  WHERE product_id = ?)
-         OR entity_id IN (SELECT id FROM releases  WHERE product_id = ?)
-         OR entity_id IN (SELECT id FROM api_keys  WHERE product_id = ?)
-        )`, productID, productID, productID, productID, productID, productID, productID)
+		q = auditOfProduct(q, productID)
 	}
 	total, err := q.Count(ctx)
 	if err != nil {
@@ -409,7 +453,8 @@ func (s *Store) GetStats(ctx context.Context) (*Stats, error) {
 func (s *Store) ListUsers(ctx context.Context, search string, offset, limit int) ([]*model.User, int, error) {
 	q := s.DB.NewSelect().Model((*model.User)(nil)).Where("role = 'user'")
 	if search != "" {
-		q = q.Where("(email ILIKE ? OR name ILIKE ?)", "%"+search+"%", "%"+search+"%")
+		term := "%" + escapeLike(search) + "%"
+		q = q.Where(`(email ILIKE ? ESCAPE '\' OR name ILIKE ? ESCAPE '\')`, term, term)
 	}
 	total, err := q.Count(ctx)
 	if err != nil {

@@ -74,7 +74,7 @@ func (s *Store) IncrementUsageCounterWithLimit(ctx context.Context, licenseID, f
 			PeriodKey: periodKey,
 			Used:      currentUsed,
 		}
-		if err := tx.Commit(); err != nil {
+		if err := commitTx(ctx, tx); err != nil {
 			return nil, false, err
 		}
 		return c, false, nil
@@ -90,7 +90,7 @@ func (s *Store) IncrementUsageCounterWithLimit(ctx context.Context, licenseID, f
 		return nil, false, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := commitTx(ctx, tx); err != nil {
 		return nil, false, err
 	}
 

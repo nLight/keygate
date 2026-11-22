@@ -54,16 +54,13 @@ func (s *Store) CheckOutFloatingWithLimit(ctx context.Context, sess *model.Float
 			return false, err
 		}
 		sess.ID = existingID
-		return false, tx.Commit()
+		return false, commitTx(ctx, tx)
 	}
 
 	// Lock the license row to serialize concurrent checkouts for the same license.
 	// FOR UPDATE on floating_sessions would lock nothing if no sessions exist,
 	// allowing two concurrent checkouts to both succeed and exceed maxSessions.
-	_, err = tx.NewRaw(`
-		SELECT id FROM licenses WHERE id = ? FOR UPDATE
-	`, sess.LicenseID).Exec(ctx)
-	if err != nil {
+	if err := lockUsableLicense(ctx, tx, sess.LicenseID); err != nil {
 		return false, err
 	}
 
@@ -87,7 +84,7 @@ func (s *Store) CheckOutFloatingWithLimit(ctx context.Context, sess *model.Float
 		return false, err
 	}
 
-	return true, tx.Commit()
+	return true, commitTx(ctx, tx)
 }
 
 func (s *Store) CheckInFloating(ctx context.Context, licenseID, identifier string) error {

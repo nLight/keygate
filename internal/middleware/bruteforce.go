@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"sync"
 	"time"
@@ -45,22 +46,42 @@ func (bf *BruteForceProtection) RecordFailure(key string) {
 	defer bf.mu.Unlock()
 
 	now := time.Now()
-	rec, exists := bf.attempts[key]
-	if !exists || now.Sub(rec.firstFailure) > bf.window {
-		bf.attempts[key] = &attemptRecord{failures: 1, firstFailure: now}
+	rec := bf.attempts[key]
+	if rec == nil {
+		rec = &attemptRecord{}
+		bf.attempts[key] = rec
+	}
+	if rec.lockedUntil.After(now) {
+		// A request that passed the guard just before this lockout began
+		// is paid for by it. Counting it would start the next, doubled
+		// lockout at once, and the count now outlives the window.
 		return
+	}
+	if now.Sub(rec.firstFailure) > bf.window {
+		// A new window starts the failure count again, but not the
+		// lockout count: that count is what doubles each further
+		// lockout, and a caller back when a lockout longer than the
+		// window ends always lands here.
+		rec.failures = 0
+		rec.firstFailure = now
+		// The count lasts as long as the longest lockout after the last
+		// one ended. An address many people share (an office, a school)
+		// that was locked out once must not have a stray typo, an hour
+		// later, start it at the cap.
+		if now.Sub(rec.lockedUntil) > bf.maxLockout {
+			rec.lockoutCount = 0
+		}
 	}
 
 	rec.failures++
 	if rec.failures >= bf.maxFails {
-		// Exponential backoff: lockout * 2^lockoutCount, capped at maxLockout
-		duration := bf.lockout
-		for i := 0; i < rec.lockoutCount; i++ {
-			duration *= 2
-			if duration > bf.maxLockout {
-				duration = bf.maxLockout
-				break
-			}
+		// Exponential backoff: lockout * 2^lockoutCount, capped at
+		// maxLockout, the first lockout included.
+		duration := min(bf.lockout, bf.maxLockout)
+		// A lockout of zero or less (BF_LOCKOUT_SECONDS=0) blocks nobody,
+		// and must not loop or overflow on a count that keeps growing.
+		for i := 0; i < rec.lockoutCount && duration > 0 && duration < bf.maxLockout; i++ {
+			duration = min(duration*2, bf.maxLockout)
 		}
 		rec.lockedUntil = now.Add(duration)
 		rec.lockoutCount++
@@ -96,29 +117,54 @@ func (bf *BruteForceProtection) IsBlocked(key string) (bool, time.Duration) {
 func (bf *BruteForceProtection) cleanup() {
 	for {
 		time.Sleep(5 * time.Minute)
-		bf.mu.Lock()
-		now := time.Now()
-		for key, rec := range bf.attempts {
-			// Remove records that are expired and not locked
-			if now.Sub(rec.firstFailure) > bf.window*4 && !rec.lockedUntil.After(now) {
-				delete(bf.attempts, key)
-			}
-		}
-		bf.mu.Unlock()
+		bf.sweep(time.Now())
 	}
 }
+
+// sweep forgets keys that have gone quiet. A key that was locked out is
+// kept until it has been quiet for as long as the longest lockout. The
+// sweep used to drop it four windows after its last lockout began,
+// which a 30 minute lockout outlasts: a caller who waited a few minutes
+// more after it started again from the shortest lockout.
+func (bf *BruteForceProtection) sweep(now time.Time) {
+	bf.mu.Lock()
+	defer bf.mu.Unlock()
+	for key, rec := range bf.attempts {
+		if rec.lockedUntil.After(now) {
+			continue
+		}
+		if rec.lockoutCount > 0 && now.Sub(rec.lockedUntil) <= bf.maxLockout {
+			continue
+		}
+		if now.Sub(rec.firstFailure) > bf.window*4 {
+			delete(bf.attempts, key)
+		}
+	}
+}
+
+// RetryAfterSeconds turns what is left of a lockout into the number a
+// client is told to wait. It rounds up: truncating 59.9 to 59 sends a
+// well-behaved client back a moment early, to another 429.
+func RetryAfterSeconds(retryAfter time.Duration) int {
+	return max(int(math.Ceil(retryAfter.Seconds())), 1)
+}
+
+// FailureKeyIP is how a failed licence attempt is filed: one namespace
+// shared by the middleware that blocks and the service that records.
+// The guard used to look up the bare address while the service wrote
+// "ip:"+address, so the early guard never fired.
+func FailureKeyIP(ip string) string { return "ip:" + ip }
 
 // LicenseBruteForceGuard is a middleware that checks brute-force state before processing.
 func LicenseBruteForceGuard(bf *BruteForceProtection) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		ip := c.ClientIP()
-		blocked, retryAfter := bf.IsBlocked(ip)
+		blocked, retryAfter := bf.IsBlocked(FailureKeyIP(c.ClientIP()))
 		if blocked {
 			BruteForceBlocks.Inc()
 			// retry_after lives in `error.details` (NOT alongside
 			// code/message) so the response shape stays the canonical
 			// envelope: { success, error: { code, message, details? } }.
-			retrySec := int(retryAfter.Seconds())
+			retrySec := RetryAfterSeconds(retryAfter)
 			c.Header("Retry-After", fmt.Sprintf("%d", retrySec))
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
 				"success": false,

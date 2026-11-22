@@ -115,7 +115,7 @@ func (s *Store) AddSeatWithinLimit(ctx context.Context, seat *model.Seat, maxSea
 	if err == nil {
 		if existing.AcceptedAt != nil {
 			*seat = *existing
-			return SeatExisted, tx.Commit()
+			return SeatExisted, commitTx(ctx, tx)
 		}
 		// Pending re-invite → rotate token, refresh expiry, allow
 		// role upgrade. user_id / accepted_at remain NULL.
@@ -131,7 +131,7 @@ func (s *Store) AddSeatWithinLimit(ctx context.Context, seat *model.Seat, maxSea
 		existing.InviteTokenHash = seat.InviteTokenHash
 		existing.InviteExpiresAt = seat.InviteExpiresAt
 		*seat = *existing
-		return SeatRestored, tx.Commit()
+		return SeatRestored, commitTx(ctx, tx)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
@@ -194,7 +194,7 @@ func (s *Store) AddSeatWithinLimit(ctx context.Context, seat *model.Seat, maxSea
 		removed.InviteTokenHash = seat.InviteTokenHash
 		removed.InviteExpiresAt = seat.InviteExpiresAt
 		*seat = *removed
-		return SeatRestored, tx.Commit()
+		return SeatRestored, commitTx(ctx, tx)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
@@ -204,7 +204,7 @@ func (s *Store) AddSeatWithinLimit(ctx context.Context, seat *model.Seat, maxSea
 	if _, err := tx.NewInsert().Model(seat).Exec(ctx); err != nil {
 		return "", err
 	}
-	return SeatCreated, tx.Commit()
+	return SeatCreated, commitTx(ctx, tx)
 }
 
 // AcceptSeatInvite consumes a plain invite token. Atomically:
@@ -300,7 +300,7 @@ func (s *Store) AcceptSeatInvite(ctx context.Context, plainToken string) (*model
 	seat.InviteTokenHash = ""
 	seat.InviteExpiresAt = nil
 
-	return user, seat, tx.Commit()
+	return user, seat, commitTx(ctx, tx)
 }
 
 // ErrSeatInviteInvalid is the single failure sentinel for accept —

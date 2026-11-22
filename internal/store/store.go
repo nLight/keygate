@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -154,7 +155,7 @@ func (s *Store) RunMigrations(dir string) error {
 				return fmt.Errorf("record migration %s: %w", entry.Name(), err)
 			}
 
-			if err := tx.Commit(); err != nil {
+			if err := commitTx(migCtx, tx); err != nil {
 				return fmt.Errorf("commit %s: %w", entry.Name(), err)
 			}
 			return nil
@@ -397,7 +398,7 @@ func (s *Store) DemoteOwnerAtomic(ctx context.Context, targetID string) error {
 		return err
 	}
 
-	return tx.Commit()
+	return commitTx(ctx, tx)
 }
 
 // ─── API Key ───
@@ -539,7 +540,7 @@ func (s *Store) CreateLicenseWithSubscription(ctx context.Context, l *model.Lice
 		}
 	}
 
-	return tx.Commit()
+	return commitTx(ctx, tx)
 }
 
 func (s *Store) FindLicenseByKey(ctx context.Context, key string) (*model.License, error) {
@@ -600,16 +601,140 @@ func (s *Store) UpdateLicenseAndSubscription(ctx context.Context, lic *model.Lic
 		return err
 	}
 
-	// Sync subscription status if one exists
+	// Sync the subscription row's status. A licence with no subscription
+	// row updates nothing, which is not an error; a failed statement is:
+	// it aborts the transaction, so carrying on would only fail at
+	// Commit, or (before this returned it) report success for a write
+	// Postgres had rolled back. (Upstream 1423918.)
 	if _, err := tx.NewRaw(`
 		UPDATE subscriptions SET status = ?, updated_at = now()
 		WHERE license_id = ? AND status != ?
 	`, lic.Status, lic.ID, lic.Status).Exec(ctx); err != nil {
-		// Non-fatal: subscription may not exist
-		slog.Warn("sync subscription status failed", "license_id", lic.ID, "error", err)
+		return fmt.Errorf("sync subscription status: %w", err)
 	}
 
-	return tx.Commit()
+	return commitTx(ctx, tx)
+}
+
+// ErrLicenseRestricted: a write driven by a Stripe event was refused
+// because the licence is revoked, suspended by an operator, or ended in
+// a way the event may not undo. Not an error to retry.
+var ErrLicenseRestricted = errors.New("license is revoked, suspended by an operator or ended")
+
+// UpdateLicenseFromWebhook is UpdateLicenseAndSubscription for a write a
+// Stripe event drives. The licence's own state is checked in the write,
+// under the row lock, so a suspension or revocation made a moment
+// earlier is never overwritten: payment can give back what non-payment
+// took, never what an operator took, nor revive a subscription that
+// ended. In particular revoking a licence cancels its subscription, and
+// the customer.subscription.deleted that follows must not turn the
+// revoked licence into a canceled one, usable until valid_until.
+// (A simplified port of upstream's guard in updateLicenseAndSubscriptionIn.)
+//
+// The write also only lands while the licence still belongs to the
+// subscription the event is about. Returns ErrLicenseRestricted when
+// refused.
+//
+// reviveCanceled lets a live status replace "canceled": only for a
+// caller that has just read the subscription from Stripe and found it
+// live (an "unpaid" subscription, mapped to canceled, that was then
+// paid). An event payload is history and may predate the end.
+func (s *Store) UpdateLicenseFromWebhook(ctx context.Context, lic *model.License, reviveCanceled bool, cols ...string) error {
+	restricted := false
+	err := RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		lic.UpdatedAt = time.Now()
+		allCols := append(append([]string{}, cols...), "updated_at")
+		if lic.Status == model.StatusSuspended && slices.Contains(cols, "status") {
+			lic.SuspendedBy = model.SuspendedByStripe
+			allCols = append(allCols, "suspended_by")
+		} else if lic.Status != model.StatusSuspended && slices.Contains(cols, "status") {
+			lic.SuspendedBy = ""
+			allCols = append(allCols, "suspended_by")
+		}
+		q := tx.NewUpdate().Model(lic).Column(allCols...).WherePK().
+			Where("status <> ?", model.StatusRevoked)
+		if lic.StripeSubscriptionID != "" {
+			q = q.Where("stripe_subscription_id = ?", lic.StripeSubscriptionID)
+		}
+		adminSuspended := bun.Safe("(status = 'suspended' AND COALESCE(suspended_by, 'admin') <> 'stripe')")
+		if !slices.Contains(cols, "status") {
+			if slices.Contains(cols, "valid_until") {
+				q = q.Where("status NOT IN (?)", bun.In([]string{model.StatusCanceled, model.StatusExpired}))
+			}
+		} else {
+			switch lic.Status {
+			case model.StatusActive, model.StatusTrialing, model.StatusPastDue:
+				q = q.Where("NOT ?", adminSuspended)
+				// Stripe never brings a deleted subscription back.
+				if !reviveCanceled {
+					q = q.Where("status <> ?", model.StatusCanceled)
+				}
+				// Still unpaid is no reason to bring back a licence that
+				// expired for want of payment; only payment does.
+				if lic.Status == model.StatusPastDue {
+					q = q.Where("NOT (status = ? AND past_due_at IS NOT NULL)", model.StatusExpired)
+				}
+			case model.StatusSuspended:
+				// A pause must not replace an operator's suspension (a
+				// resume would then lift it), nor reach an ended licence.
+				q = q.Where("NOT ?", adminSuspended).
+					Where("status NOT IN (?)", bun.In([]string{model.StatusCanceled, model.StatusExpired}))
+			case model.StatusCanceled, model.StatusExpired:
+				// The subscription ended: an operator's suspension stays.
+				q = q.Where("NOT ?", adminSuspended)
+			}
+		}
+		res, err := q.Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			// Refused. A renewal paid while an operator holds the licence
+			// suspended still records its paid-through date, so a later
+			// reinstate gives back the period the customer paid for; the
+			// suspension itself stays.
+			if lic.ValidUntil != nil && slices.Contains(cols, "valid_until") {
+				q2 := tx.NewUpdate().Model((*model.License)(nil)).
+					Set("valid_until = ?, updated_at = now()", *lic.ValidUntil).
+					Where("id = ?", lic.ID).
+					Where("?", adminSuspended)
+				if lic.StripeSubscriptionID != "" {
+					q2 = q2.Where("stripe_subscription_id = ?", lic.StripeSubscriptionID)
+				}
+				if _, err := q2.Exec(ctx); err != nil {
+					return err
+				}
+			}
+			// Committed (the date above), then reported as refused.
+			restricted = true
+			return nil
+		}
+		if slices.Contains(cols, "status") {
+			if _, err := tx.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now()
+				WHERE license_id = ? AND status != ?`, lic.Status, lic.ID, lic.Status).Exec(ctx); err != nil {
+				return fmt.Errorf("sync subscription status: %w", err)
+			}
+		}
+		return nil
+	})
+	if err == nil && restricted {
+		return ErrLicenseRestricted
+	}
+	return err
+}
+
+// SetLiveLicenseValidUntil moves valid_until on a licence that has not
+// ended. A date-only write must not push the date out on a canceled,
+// expired or revoked licence: canceled access lasts until valid_until,
+// so cancel-at-period-end racing an immediate cancel would restore it
+// until the period end. (Upstream 9b64ba9, #125.)
+func (s *Store) SetLiveLicenseValidUntil(ctx context.Context, id string, validUntil time.Time) error {
+	_, err := s.DB.NewUpdate().Model((*model.License)(nil)).
+		Set("valid_until = ?, updated_at = now()", validUntil).
+		Where("id = ?", id).
+		Where("status NOT IN (?)", bun.In([]string{model.StatusCanceled, model.StatusExpired, model.StatusRevoked})).
+		Exec(ctx)
+	return err
 }
 
 func (s *Store) ListLicensesByEmail(ctx context.Context, email string) ([]*model.License, error) {
@@ -644,6 +769,12 @@ type LicenseListFilter struct {
 	Limit               int
 }
 
+// escapeLike makes a search term match literally in LIKE / ILIKE ...
+// ESCAPE '\': its %, _ and \ stand for themselves.
+func escapeLike(term string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(term)
+}
+
 func (s *Store) ListLicenses(ctx context.Context, f LicenseListFilter) ([]*model.License, int, error) {
 	q := s.DB.NewSelect().Model((*model.License)(nil)).
 		Relation("Plan").Relation("Product").
@@ -661,8 +792,12 @@ func (s *Store) ListLicenses(ctx context.Context, f LicenseListFilter) ([]*model
 		q = q.Where("license.external_workspace_id = ?", f.ExternalWorkspaceID)
 	}
 	if f.Search != "" {
-		// Only search by email and key prefix — never expose full key via wildcard search.
-		q = q.Where("(license.email ILIKE ? OR license.license_key LIKE ?)", "%"+f.Search+"%", f.Search+"%")
+		// Email by substring; a license key only as a whole, by its hash.
+		// Plaintext keys are not stored, so the old key-prefix LIKE
+		// matched nothing, and a wildcard over keys is not wanted anyway.
+		term := "%" + escapeLike(f.Search) + "%"
+		q = q.Where(`(license.email ILIKE ? ESCAPE '\' OR license.key_hash = ?)`,
+			term, license.HashKey(strings.TrimSpace(f.Search)))
 	}
 	total, err := q.Count(ctx)
 	if err != nil {
@@ -842,6 +977,23 @@ func (s *Store) RecordNotification(ctx context.Context, licenseID, tag string) {
 	).Exec(ctx)
 }
 
+// ClaimNotification records a notification for a license before it is
+// sent, and reports whether this caller is the one to send it. The
+// insert is the claim: of several replicas (or two webhooks racing)
+// running the same reminder, exactly one gets true. A check-then-record
+// let every one of them see "not sent" and mail the customer.
+func (s *Store) ClaimNotification(ctx context.Context, licenseID, tag string) (bool, error) {
+	res, err := s.DB.NewRaw(
+		"INSERT INTO notifications (id, license_id, tag) VALUES (?, ?, ?) ON CONFLICT (license_id, tag) DO NOTHING",
+		newID(), licenseID, tag,
+	).Exec(ctx)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // ─── Refresh Tokens ───
 
 type RefreshToken struct {
@@ -927,7 +1079,7 @@ func (s *Store) RotateRefreshToken(ctx context.Context, tokenHash string) (*Refr
 		return nil, err
 	}
 	rt.RevokedAt = &now
-	return rt, tx.Commit()
+	return rt, commitTx(ctx, tx)
 }
 
 // DeleteRefreshToken removes a token outright. Used on logout, where
@@ -989,7 +1141,7 @@ func (s *Store) CreateOTPCodeWithLimit(ctx context.Context, otp *model.OTPCode, 
 	if _, err := tx.NewInsert().Model(otp).Exec(ctx); err != nil {
 		return false, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commitTx(ctx, tx); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1039,7 +1191,7 @@ func (s *Store) ConsumeOTPCode(ctx context.Context, email, candidateVerifier, du
 	if n, _ := res.RowsAffected(); n != 1 {
 		return nil, false, nil
 	}
-	if err := tx.Commit(); err != nil {
+	if err := commitTx(ctx, tx); err != nil {
 		return nil, false, err
 	}
 	otp.Attempts++
@@ -1097,6 +1249,34 @@ func (s *Store) ForgetProcessedEvent(ctx context.Context, provider, eventID stri
 
 // ─── Transactional Activation ───
 
+// stoppedLicenseStatuses are the statuses under which a licence takes no
+// new device or floating session.
+var stoppedLicenseStatuses = []string{model.StatusSuspended, model.StatusExpired, model.StatusRevoked}
+
+// LicenseStoppedError: the licence was revoked, suspended or expired
+// after the caller read it usable and before it took the licence lock.
+type LicenseStoppedError struct{ Status string }
+
+func (e *LicenseStoppedError) Error() string { return "license is " + e.Status }
+
+// lockUsableLicense takes the licence row lock that serialises new
+// devices and sessions, and refuses one that is stopped. The caller
+// checked the status before the lock; a revoke, suspend or expiry that
+// committed in between must not be followed by a new device or session
+// (revoke deletes them, so one added after it would outlive it).
+func lockUsableLicense(ctx context.Context, tx bun.Tx, licenseID string) error {
+	var status string
+	if err := tx.NewRaw("SELECT status FROM licenses WHERE id = ? FOR UPDATE", licenseID).Scan(ctx, &status); err != nil {
+		return err
+	}
+	for _, st := range stoppedLicenseStatuses {
+		if status == st {
+			return &LicenseStoppedError{Status: status}
+		}
+	}
+	return nil
+}
+
 // ActivateWithinLimit atomically creates an activation only if the limit hasn't been reached.
 // Locks the license row (not activation rows) to serialize concurrent activations.
 func (s *Store) ActivateWithinLimit(ctx context.Context, act *model.Activation, maxActivations int) error {
@@ -1110,9 +1290,9 @@ func (s *Store) ActivateWithinLimit(ctx context.Context, act *model.Activation, 
 	}
 	defer tx.Rollback()
 
-	// Lock the license row to serialize concurrent activations
-	_, err = tx.NewRaw("SELECT id FROM licenses WHERE id = ? FOR UPDATE", act.LicenseID).Exec(ctx)
-	if err != nil {
+	// Lock the license row to serialize concurrent activations, and
+	// re-read its status under the lock (see lockUsableLicense).
+	if err := lockUsableLicense(ctx, tx, act.LicenseID); err != nil {
 		return err
 	}
 
@@ -1135,7 +1315,7 @@ func (s *Store) ActivateWithinLimit(ctx context.Context, act *model.Activation, 
 		return err
 	}
 
-	return tx.Commit()
+	return commitTx(ctx, tx)
 }
 
 // ─── Email Queue ───
@@ -1489,4 +1669,31 @@ func (s *Store) WithKeyMaintenanceLock(ctx context.Context, fn func(context.Cont
 	}()
 
 	return fn(ctx)
+}
+
+// commitTx commits, first making sure the transaction can still commit.
+// pgdriver answers nil to a COMMIT that Postgres turned into a rollback,
+// so a failed statement whose error was dropped would read as a write
+// that landed. Any statement on an aborted transaction fails (25P02);
+// this one costs a round trip and nothing else. (Upstream da630ed.)
+func commitTx(ctx context.Context, tx bun.Tx) error {
+	if _, err := tx.ExecContext(ctx, "SELECT 1"); err != nil {
+		return fmt.Errorf("transaction cannot commit: %w", err)
+	}
+	return tx.Commit()
+}
+
+// RunInTx runs fn in a transaction and commits it through commitTx, so
+// a statement that failed inside fn (even with its error dropped) is
+// reported instead of reading as a write that landed.
+func RunInTx(ctx context.Context, db *bun.DB, fn func(ctx context.Context, tx bun.Tx) error) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := fn(ctx, tx); err != nil {
+		return err
+	}
+	return commitTx(ctx, tx)
 }
